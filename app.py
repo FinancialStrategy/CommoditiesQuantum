@@ -7693,8 +7693,11 @@ except Exception:
 # =============================================================================
 
 def run_usdjpy_fz_reaction_monitor():
-    """USDJPY FZ Reaction Monitor (Michaelis–Menten + Peak-Down) — merged as a separate mode."""
+    """Michaelis–Menten Reaction Monitor (USDJPY FZ + Peak-Down) — merged as a separate mode."""
     import streamlit as st
+    st.title("📈 Michaelis–Menten Reaction Monitor — USDJPY FZ + Peak-Down")
+    st.caption("Michaelis–Menten saturating speed + Peak-Down hazard model. Educational/research use.")
+
     import hashlib, time as _time
     # Stable widget namespace for this mode (prevents StreamlitDuplicateElementKey)
     if "__mm_widget_ns" not in st.session_state:
@@ -8393,19 +8396,20 @@ def _run_app_router():
     import streamlit as st
 
     st.sidebar.markdown("### 🧭 Platform Mode")
+    st.sidebar.info("✅ New mode: Michaelis–Menten USDJPY Reaction Monitor")
     mode = st.sidebar.radio(
         "Select application layer",
         options=[
             "🏛️ Institutional Commodities Platform (v6.x)",
             "🧪 Scientific Commodities Platform (v7.2 Ultra)",
             "🧠 Quantum Sovereign Terminal (v14.0)",
-            "📈 USDJPY FZ Reaction Monitor (MM + Peak-Down)"
+            "📈 Michaelis–Menten Reaction Monitor (USDJPY FZ + Peak-Down)"
         ],
         index=0,
         key="app_mode_selector"
     )
 
-    if mode == "📈 USDJPY FZ Reaction Monitor (MM + Peak-Down)":
+    if mode == "📈 Michaelis–Menten Reaction Monitor (USDJPY FZ + Peak-Down)":
         run_usdjpy_fz_reaction_monitor()
     elif mode == "🧠 Quantum Sovereign Terminal (v14.0)":
         run_quantum_sovereign_v14_terminal()
