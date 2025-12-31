@@ -1,3 +1,4 @@
+
 """
 🏛️ Institutional Commodities Analytics Platform v6.1
 Integrated Portfolio Analytics • Advanced GARCH & Regime Detection • Machine Learning • Professional Reporting
@@ -1131,11 +1132,14 @@ class EnhancedDataManager:
 class InstitutionalAnalytics:
     """Institutional-grade analytics engine with advanced methods"""
     
-    def __init__(self, risk_free_rate: float = 0.02):
+    def __init__(self, risk_free_rate: float = 0.02, cfg: Optional[Any] = None):
         self.risk_free_rate = risk_free_rate
-        self.annual_trading_days = 252
-
-
+        # Optional config injected by the dashboard (kept for backwards compatibility)
+        self.cfg = cfg
+        try:
+            self.annual_trading_days = int(getattr(cfg, "annual_trading_days", 252)) if cfg is not None else 252
+        except Exception:
+            self.annual_trading_days = 252
     # =========================================================================
     # NUMERICAL STABILITY HELPERS (Higham-style PSD / correlation repairs)
     # =========================================================================
@@ -1689,7 +1693,8 @@ class InstitutionalAnalytics:
 
         arch_model = dep_manager.dependencies["arch"]["arch_model"]
 
-        annual_days = float(getattr(self.cfg, "annual_trading_days", 252))
+        cfg_obj = getattr(self, "cfg", None)
+        annual_days = float(getattr(cfg_obj, "annual_trading_days", getattr(self, "annual_trading_days", 252)))
         ann_scale = math.sqrt(annual_days) if annualize else 1.0
 
         results: List[Dict[str, Any]] = []
@@ -1773,19 +1778,46 @@ class InstitutionalAnalytics:
         self,
         returns: pd.Series,
         n_regimes: int = 3,
-        features: List[str] = None
+        features: List[str] = None,
+        n_states: Optional[int] = None,
+        **kwargs
     ) -> Dict[str, Any]:
-        """Detect market regimes using HMM"""
+        """Detect market regimes using HMM (HMMLearn).
+        Accepts legacy keyword aliases (n_states) for backwards compatibility.
+        """
+
+        # Backwards-compatible aliases
+        if n_states is not None:
+            try:
+                n_regimes = int(n_states)
+            except Exception:
+                pass
+        # Also accept common aliases via **kwargs
+        if "n_components" in kwargs and kwargs.get("n_components") is not None:
+            try:
+                n_regimes = int(kwargs.get("n_components"))
+            except Exception:
+                pass
+
         if not dep_manager.is_available('hmmlearn'):
-            return {'available': False, 'message': 'HMM package not available'}
-        
+            return {
+                'available': False,
+                'success': False,
+                'message': 'HMM package not available. Add `hmmlearn` + `scikit-learn` to requirements.txt to enable regime detection.',
+            }
+
         if features is None:
             features = ['returns', 'volatility', 'volume']
         
         returns_clean = returns.dropna()
         
         if len(returns_clean) < 260:
-            return {'available': False, 'message': 'Insufficient data for regime detection'}
+            return {
+                'available': True,
+                'success': False,
+                'message': 'Insufficient data for regime detection (need at least ~260 observations).',
+                'n_obs': int(len(returns_clean)),
+            }
         
         try:
             # Prepare features
@@ -1858,6 +1890,13 @@ class InstitutionalAnalytics:
             
             return {
                 'available': True,
+                'success': True,
+                'message': 'Regime detection completed.',
+                'n_regimes': int(n_regimes),
+                # Backwards-compatible keys for existing UI code
+                'states': regimes,
+                'state_probabilities': regime_probs,
+                # Preferred explicit keys
                 'regimes': regimes,
                 'regime_probs': regime_probs,
                 'regime_stats': regime_stats,
@@ -1867,7 +1906,7 @@ class InstitutionalAnalytics:
             }
             
         except Exception as e:
-            return {'available': False, 'message': f'Regime detection failed: {str(e)}'}
+            return {'available': False, 'success': False, 'message': f'Regime detection failed: {str(e)}'}
     
     # =========================================================================
     # RISK METRICS
@@ -3662,15 +3701,17 @@ class InstitutionalCommoditiesDashboard:
 
 
             cfg = st.session_state.get("analysis_config")
-
-
             if cfg is None or not isinstance(cfg, AnalysisConfiguration):
-
-
                 cfg = AnalysisConfiguration()
-
-
                 st.session_state["analysis_config"] = cfg
+
+            # Inject cfg into analytics (fixes GARCH/regime modules referencing cfg)
+            try:
+                self.analytics.cfg = cfg
+                if hasattr(cfg, "annual_trading_days"):
+                    self.analytics.annual_trading_days = int(getattr(cfg, "annual_trading_days", self.analytics.annual_trading_days))
+            except Exception:
+                pass
 
 
             if not st.session_state.get("data_loaded", False):
@@ -3996,6 +4037,7 @@ def run_quantum_sovereign_v14_terminal():
     _XGB_OK = False
     _TF_OK = False
     _SKL_OK = False
+    _PYCARET_OK = False
 
     try:
         import xgboost as xgb
@@ -4004,13 +4046,37 @@ def run_quantum_sovereign_v14_terminal():
         xgb = None
         _XGB_OK = False
 
+    # scikit-learn stack (scaling + classical ML baselines)
     try:
         from sklearn.preprocessing import MinMaxScaler
+        from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor
+        from sklearn.linear_model import Ridge, ElasticNet
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
         _SKL_OK = True
     except Exception:
         MinMaxScaler = None
+        RandomForestRegressor = ExtraTreesRegressor = GradientBoostingRegressor = None
+        Ridge = ElasticNet = None
+        TimeSeriesSplit = None
+        mean_squared_error = mean_absolute_error = r2_score = None
         _SKL_OK = False
 
+    # PyCaret AutoML (optional; heavy dependency)
+    try:
+        from pycaret.regression import (
+            setup as pyc_setup,
+            compare_models as pyc_compare_models,
+            tune_model as pyc_tune_model,
+            finalize_model as pyc_finalize_model,
+            pull as pyc_pull,
+        )
+        _PYCARET_OK = True
+    except Exception:
+        pyc_setup = pyc_compare_models = pyc_tune_model = pyc_finalize_model = pyc_pull = None
+        _PYCARET_OK = False
+
+    # TensorFlow (optional; enables LSTM deep learning component)
     try:
         from tensorflow.keras.models import Sequential
         from tensorflow.keras.layers import LSTM, Dense, Dropout, SimpleRNN, BatchNormalization
@@ -4086,71 +4152,320 @@ def run_quantum_sovereign_v14_terminal():
     # =============================================================================
 
     class QuantumAIEngine:
-        def __init__(self, lookback: int = 60):
-            self.lookback = lookback
-            self.scalers = {}
+        """Hybrid forecasting engine.
 
-        def _prepare_data(self, data: pd.Series):
+        - Core: XGBoost + classical scikit-learn regressors (fast, Cloud-friendly)
+        - Optional: TensorFlow LSTM (deep learning)
+        - Optional: PyCaret AutoML (model comparison + best-model finalization)
+        """
+
+        def __init__(self, lookback: int = 60, seed: int = 42):
+            self.lookback = int(lookback)
+            self.seed = int(seed)
+
+        # ---------------------------
+        # Data preparation
+        # ---------------------------
+        def _clean_series(self, data: pd.Series) -> pd.Series:
+            s = pd.to_numeric(data, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            # guard against duplicated timestamps
+            try:
+                s = s[~s.index.duplicated(keep="last")]
+            except Exception:
+                pass
+            return s
+
+        def _prepare_supervised(self, data: pd.Series):
+            """Return (clean_series, X, y, scaled_full, scaler)."""
             if not _SKL_OK or MinMaxScaler is None:
-                raise RuntimeError("scikit-learn is required for MinMaxScaler.")
+                raise RuntimeError("scikit-learn is required for scaling + sklearn baselines.")
+            s = self._clean_series(data)
+            if len(s) < (self.lookback + 40):
+                raise RuntimeError(f"Not enough history for ML: need >= {self.lookback + 40} points, got {len(s)}.")
             scaler = MinMaxScaler(feature_range=(0, 1))
-            scaled_data = scaler.fit_transform(data.values.reshape(-1, 1))
-            X, y = [], []
-            for i in range(self.lookback, len(scaled_data)):
-                X.append(scaled_data[i-self.lookback:i, 0])
-                y.append(scaled_data[i, 0])
-            return np.array(X), np.array(y), scaled_data, scaler
+            scaled_full = scaler.fit_transform(s.values.reshape(-1, 1)).astype(float).flatten()
 
+            X, y = [], []
+            for i in range(self.lookback, len(scaled_full)):
+                X.append(scaled_full[i - self.lookback:i])
+                y.append(scaled_full[i])
+            X = np.asarray(X, dtype=float)
+            y = np.asarray(y, dtype=float)
+            return s, X, y, scaled_full, scaler
+
+        # ---------------------------
+        # Model builders
+        # ---------------------------
         def build_lstm(self):
             if not _TF_OK or Sequential is None:
                 raise RuntimeError("tensorflow is required for LSTM model.")
             model = Sequential([
-                LSTM(100, return_sequences=True, input_shape=(self.lookback, 1)),
+                LSTM(96, return_sequences=True, input_shape=(self.lookback, 1)),
                 BatchNormalization(),
-                Dropout(0.3),
-                LSTM(50, return_sequences=False),
-                Dropout(0.3),
-                Dense(25, activation='relu'),
+                Dropout(0.25),
+                LSTM(64, return_sequences=False),
+                Dropout(0.25),
+                Dense(32, activation="relu"),
                 Dense(1)
             ])
-            model.compile(optimizer='adam', loss='mse')
+            model.compile(optimizer="adam", loss="mse")
             return model
 
-        def run_prediction(self, data: pd.Series, steps: int = 15) -> Dict[str, np.ndarray]:
-            X, y, scaled_full, scaler = self._prepare_data(data)
+        def _build_sklearn_model(self, name: str):
+            if not _SKL_OK:
+                raise RuntimeError("scikit-learn is required for sklearn models.")
+            n = (name or "").strip().lower()
 
-            # 1. XGBoost Fit
+            if n in ("randomforest", "rf", "random forest"):
+                if RandomForestRegressor is None:
+                    raise RuntimeError("RandomForestRegressor not available.")
+                return RandomForestRegressor(
+                    n_estimators=500, max_depth=None, min_samples_leaf=2,
+                    random_state=self.seed, n_jobs=-1
+                )
+
+            if n in ("extratrees", "et", "extra trees"):
+                if ExtraTreesRegressor is None:
+                    raise RuntimeError("ExtraTreesRegressor not available.")
+                return ExtraTreesRegressor(
+                    n_estimators=600, max_depth=None, min_samples_leaf=2,
+                    random_state=self.seed, n_jobs=-1
+                )
+
+            if n in ("gbr", "gradientboosting", "gradient boosting"):
+                if GradientBoostingRegressor is None:
+                    raise RuntimeError("GradientBoostingRegressor not available.")
+                return GradientBoostingRegressor(random_state=self.seed)
+
+            if n in ("ridge",):
+                if Ridge is None:
+                    raise RuntimeError("Ridge not available.")
+                return Ridge(alpha=1.0, random_state=self.seed)
+
+            if n in ("elasticnet", "enet", "elastic net"):
+                if ElasticNet is None:
+                    raise RuntimeError("ElasticNet not available.")
+                return ElasticNet(alpha=0.001, l1_ratio=0.35, random_state=self.seed)
+
+            raise ValueError(f"Unknown sklearn model: {name}")
+
+        def _build_xgb_model(self):
             if not _XGB_OK or xgb is None:
                 raise RuntimeError("xgboost is required for XGBoost model.")
-            xgb_model = xgb.XGBRegressor(n_estimators=1000, max_depth=7, learning_rate=0.03, subsample=0.8)
-            xgb_model.fit(X, y)
+            # Settings tuned to be reasonably strong while still Cloud-feasible
+            return xgb.XGBRegressor(
+                n_estimators=1200,
+                max_depth=7,
+                learning_rate=0.03,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                reg_alpha=0.0,
+                reg_lambda=1.0,
+                objective="reg:squarederror",
+                random_state=self.seed,
+                n_jobs=-1
+            )
 
-            # 2. LSTM Fit
-            lstm_model = self.build_lstm()
-            early_stop = EarlyStopping(monitor='loss', patience=5) if EarlyStopping is not None else None
-            callbacks = [early_stop] if early_stop is not None else []
-            lstm_model.fit(X.reshape(X.shape[0], X.shape[1], 1), y, epochs=20, batch_size=32, verbose=0, callbacks=callbacks)
+        # ---------------------------
+        # Evaluation helpers
+        # ---------------------------
+        def _holdout_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+            out = {}
+            try:
+                if mean_squared_error is not None:
+                    out["RMSE"] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+                else:
+                    out["RMSE"] = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+            except Exception:
+                out["RMSE"] = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
-            # Recursive Forecasting
-            preds_xgb, preds_lstm = [], []
-            curr_window_xgb = scaled_full[-self.lookback:].flatten()
-            curr_window_lstm = scaled_full[-self.lookback:].reshape(1, self.lookback, 1)
+            try:
+                if mean_absolute_error is not None:
+                    out["MAE"] = float(mean_absolute_error(y_true, y_pred))
+                else:
+                    out["MAE"] = float(np.mean(np.abs(y_true - y_pred)))
+            except Exception:
+                out["MAE"] = float(np.mean(np.abs(y_true - y_pred)))
 
-            for _ in range(steps):
-                # XGB Prediction
-                p_xgb = xgb_model.predict(curr_window_xgb.reshape(1, -1))[0]
-                preds_xgb.append(p_xgb)
-                curr_window_xgb = np.append(curr_window_xgb[1:], p_xgb)
+            try:
+                if r2_score is not None:
+                    out["R2"] = float(r2_score(y_true, y_pred))
+            except Exception:
+                pass
+            return out
 
-                # LSTM Prediction
-                p_lstm = lstm_model.predict(curr_window_lstm, verbose=0)[0, 0]
-                preds_lstm.append(p_lstm)
-                curr_window_lstm = np.append(curr_window_lstm[:, 1:, :], [[[p_lstm]]], axis=1)
+        def _fit_and_eval(self, model, X: np.ndarray, y: np.ndarray, test_frac: float = 0.2):
+            n = len(X)
+            split = int(max(1, min(n - 1, round(n * (1 - float(test_frac))))))
+            Xtr, ytr = X[:split], y[:split]
+            Xte, yte = X[split:], y[split:]
+            model.fit(Xtr, ytr)
+            pred = model.predict(Xte)
+            metrics = self._holdout_metrics(yte, pred) if len(yte) > 3 else {}
+            return model, metrics
 
-            return {
-                "XGBoost": scaler.inverse_transform(np.array(preds_xgb).reshape(-1, 1)),
-                "LSTM": scaler.inverse_transform(np.array(preds_lstm).reshape(-1, 1))
+        def _recursive_forecast(self, model, last_window: np.ndarray, steps: int) -> np.ndarray:
+            w = np.asarray(last_window, dtype=float).flatten()
+            preds = []
+            for _ in range(int(steps)):
+                p = float(model.predict(w.reshape(1, -1))[0])
+                preds.append(p)
+                w = np.append(w[1:], p)
+            return np.asarray(preds, dtype=float)
+
+        # ---------------------------
+        # PyCaret AutoML (optional)
+        # ---------------------------
+        def _pycaret_fit_best(self, X: np.ndarray, y: np.ndarray, fold: int = 3):
+            if not _PYCARET_OK or pyc_setup is None:
+                raise RuntimeError("pycaret is not available.")
+            # Build dataframe with stable column names
+            df = pd.DataFrame(X, columns=[f"lag_{i+1}" for i in range(X.shape[1])])
+            df["y"] = y
+
+            # Setup w/ time-series fold strategy
+            pyc_setup(
+                data=df,
+                target="y",
+                fold_strategy="timeseries",
+                fold=int(max(2, fold)),
+                session_id=int(self.seed),
+                silent=True,
+                html=False,
+                verbose=False
+            )
+
+            best = pyc_compare_models(sort="RMSE")
+            # Small tuning budget; keep Cloud-friendly
+            try:
+                best = pyc_tune_model(best, optimize="RMSE", n_iter=10)
+            except Exception:
+                pass
+            final = pyc_finalize_model(best)
+
+            leaderboard = None
+            try:
+                leaderboard = pyc_pull()
+            except Exception:
+                leaderboard = None
+
+            return final, leaderboard
+
+        # ---------------------------
+        # Public API
+        # ---------------------------
+        def run_prediction(
+            self,
+            data: pd.Series,
+            steps: int = 15,
+            models: Optional[List[str]] = None,
+            use_pycaret: bool = False,
+            return_meta: bool = False,
+        ):
+            """Train selected models + return recursive forecasts.
+
+            Returns:
+                forecasts: Dict[str, np.ndarray]  (each is shape [steps, 1] in ORIGINAL scale)
+                meta (optional): Dict with metrics + leaderboards
+            """
+            s, X, y, scaled_full, scaler = self._prepare_supervised(data)
+
+            # Default model suite
+            if models is None:
+                models = ["XGBoost", "RandomForest", "ExtraTrees"]
+                if _TF_OK:
+                    models.append("LSTM")
+                if use_pycaret and _PYCARET_OK:
+                    models.append("PyCaret AutoML")
+
+            models = list(dict.fromkeys(models))  # unique, preserve order
+
+            meta: Dict[str, Any] = {"metrics": {}, "notes": []}
+            forecasts_scaled: Dict[str, np.ndarray] = {}
+
+            # Build last window (scaled)
+            last_win = scaled_full[-self.lookback:].astype(float).flatten()
+
+            # 1) XGBoost
+            if any(m.lower().startswith("xgb") or m.lower() == "xgboost" for m in models):
+                try:
+                    xgb_model = self._build_xgb_model()
+                    xgb_model, met = self._fit_and_eval(xgb_model, X, y)
+                    forecasts_scaled["XGBoost"] = self._recursive_forecast(xgb_model, last_win, steps)
+                    meta["metrics"]["XGBoost"] = met
+                except Exception as e:
+                    meta["notes"].append(f"XGBoost failed: {e}")
+
+            # 2) scikit-learn classical models
+            sklearn_map = {
+                "RandomForest": ["randomforest", "rf", "random forest"],
+                "ExtraTrees": ["extratrees", "et", "extra trees"],
+                "GradientBoosting": ["gbr", "gradientboosting", "gradient boosting"],
+                "Ridge": ["ridge"],
+                "ElasticNet": ["elasticnet", "enet", "elastic net"],
             }
+            for label, aliases in sklearn_map.items():
+                if any((m or "").strip().lower() in aliases or (m or "").strip().lower() == label.lower() for m in models):
+                    try:
+                        mdl = self._build_sklearn_model(label)
+                        mdl, met = self._fit_and_eval(mdl, X, y)
+                        forecasts_scaled[label] = self._recursive_forecast(mdl, last_win, steps)
+                        meta["metrics"][label] = met
+                    except Exception as e:
+                        meta["notes"].append(f"{label} failed: {e}")
+
+            # 3) LSTM (optional)
+            if any((m or "").strip().lower() == "lstm" for m in models) and _TF_OK:
+                try:
+                    lstm_model = self.build_lstm()
+                    early_stop = EarlyStopping(monitor="loss", patience=5) if EarlyStopping is not None else None
+                    callbacks = [early_stop] if early_stop is not None else []
+                    lstm_model.fit(
+                        X.reshape(X.shape[0], X.shape[1], 1),
+                        y,
+                        epochs=18,
+                        batch_size=32,
+                        verbose=0,
+                        callbacks=callbacks
+                    )
+                    preds_lstm = []
+                    curr = scaled_full[-self.lookback:].reshape(1, self.lookback, 1).astype(float)
+                    for _ in range(int(steps)):
+                        p = float(lstm_model.predict(curr, verbose=0)[0, 0])
+                        preds_lstm.append(p)
+                        curr = np.append(curr[:, 1:, :], [[[p]]], axis=1)
+                    forecasts_scaled["LSTM"] = np.asarray(preds_lstm, dtype=float)
+                except Exception as e:
+                    meta["notes"].append(f"LSTM failed: {e}")
+
+            # 4) PyCaret AutoML (optional)
+            if (use_pycaret or any("pycaret" in (m or "").lower() for m in models)) and _PYCARET_OK:
+                try:
+                    best_model, leaderboard = self._pycaret_fit_best(X, y, fold=3)
+                    forecasts_scaled["PyCaret AutoML"] = self._recursive_forecast(best_model, last_win, steps)
+                    if leaderboard is not None:
+                        meta["pycaret_leaderboard"] = leaderboard
+                except Exception as e:
+                    meta["notes"].append(f"PyCaret AutoML failed: {e}")
+
+            # Convert all forecasts back to original scale
+            forecasts: Dict[str, np.ndarray] = {}
+            for k, v in forecasts_scaled.items():
+                try:
+                    forecasts[k] = scaler.inverse_transform(np.asarray(v).reshape(-1, 1))
+                except Exception:
+                    forecasts[k] = np.asarray(v).reshape(-1, 1)
+
+            # Add ensemble (mean) if multiple models
+            if len(forecasts) >= 2:
+                try:
+                    fdf = pd.DataFrame({k: forecasts[k].flatten() for k in forecasts.keys()})
+                    forecasts["Ensemble"] = fdf.mean(axis=1).values.reshape(-1, 1)
+                except Exception:
+                    pass
+
+            return (forecasts, meta) if return_meta else forecasts
+
 
     # =============================================================================
     # 4. SIGNAL & RISK INTELLIGENCE
@@ -4159,7 +4474,7 @@ def run_quantum_sovereign_v14_terminal():
     class SignalIntelligence:
         @staticmethod
         def generate_trade_parameters(current_p, forecast_df, ann_vol):
-            ensemble_forecast = forecast_df.mean(axis=1)
+            ensemble_forecast = forecast_df["Ensemble"] if "Ensemble" in getattr(forecast_df, "columns", []) else forecast_df.mean(axis=1)
             target = ensemble_forecast.iloc[-1]
             expected_ret = (target - current_p) / current_p
 
@@ -4230,20 +4545,34 @@ def run_quantum_sovereign_v14_terminal():
             """, unsafe_allow_html=True)
 
         def _dep_warnings(self):
-            missing = []
+            """Show non-fatal dependency hints (Cloud-safe)."""
+            missing_core = []
+            missing_optional = []
+
             if not _XGB_OK:
-                missing.append("xgboost")
-            if not _TF_OK:
-                missing.append("tensorflow")
+                missing_core.append("xgboost")
             if not _SKL_OK:
-                missing.append("scikit-learn")
-            if missing:
-                st.warning("Quantum AI modules require extra packages not found in this environment: " + ", ".join(missing))
+                missing_core.append("scikit-learn")
+
+            # Optional (only used in specific AI modes)
+            if not _TF_OK:
+                missing_optional.append("tensorflow (enables LSTM)")
+            if not _PYCARET_OK:
+                missing_optional.append("pycaret (enables AutoML)")
+
+            if missing_core or missing_optional:
+                st.warning("Quantum AI modules: some optional components are unavailable in this environment.")
+                if missing_core:
+                    st.error("Missing **core** ML packages: " + ", ".join(missing_core))
+                if missing_optional:
+                    st.info("Missing **optional** add-ons: " + ", ".join(missing_optional))
+
                 st.code(
-                    "requirements.txt suggestions:\n"
+                    "requirements.txt suggestions (add only what you need):\n"
                     "xgboost\n"
                     "scikit-learn\n"
-                    "tensorflow\n"
+                    "tensorflow  # optional: deep learning\n"
+                    "pycaret[full]  # optional: AutoML\n"
                 )
 
         def run(self):
@@ -4291,7 +4620,7 @@ def run_quantum_sovereign_v14_terminal():
 
                             forecast_dict = None
                             f_df = None
-                            if _XGB_OK and _TF_OK and _SKL_OK:
+                            if _XGB_OK and _SKL_OK:
                                 try:
                                     forecast_dict = self.ai.run_prediction(price_data[ticker])
                                     f_df = pd.DataFrame(forecast_dict)
@@ -4329,27 +4658,167 @@ def run_quantum_sovereign_v14_terminal():
                                         line=dict(dash='dash', color=signal['Color'])
                                     ))
                                 fig.update_layout(template="plotly_dark", height=250, margin=dict(l=0, r=0, t=20, b=0))
-                                st.plotly_chart(fig, use_container_width=True, key=f"qs_sig_chart_{ticker}")
-
+                            
                     with t2:
-                        st.markdown("### 🧠 Quantum AI Decomposition")
-                        st.write("Comparison of LSTM (Deep Learning) vs XGBoost (Gradient Boosting) Paths")
+                        st.markdown("### 🧠 ML Forecast Lab (XGBoost • scikit-learn • PyCaret AutoML)")
+                        st.write("Institutional-grade *multi-model* forecasting with holdout diagnostics and an ensemble path.")
 
-                        if not (_XGB_OK and _TF_OK and _SKL_OK):
-                            st.info("Install xgboost + tensorflow + scikit-learn to enable AI forecast comparison charts.")
+                        if not (_XGB_OK and _SKL_OK):
+                            st.info("Install **xgboost** + **scikit-learn** to enable ML forecasting. Optional add-ons: **tensorflow** (LSTM) and **pycaret** (AutoML).")
                         else:
+                            # Controls
                             pick = st.selectbox("Select asset", selected_tickers, index=0, key="qs_ai_pick")
-                            f_df = st.session_state.get("qs_forecasts", {}).get(pick, None)
-                            if f_df is None:
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                steps = st.slider("Forecast steps (business days)", 5, 45, 15, 1, key="qs_ai_steps")
+                            with c2:
+                                lookback = st.slider("Lookback window", 20, 200, 60, 5, key="qs_ai_lookback")
+                            with c3:
+                                use_pycaret = st.checkbox("Enable PyCaret AutoML (heavy)", value=False, key="qs_ai_use_pycaret", disabled=not _PYCARET_OK)
+
+                            # Update engine lookback live
+                            try:
+                                self.ai.lookback = int(lookback)
+                            except Exception:
+                                pass
+
+                            model_choices = ["XGBoost", "RandomForest", "ExtraTrees", "GradientBoosting", "Ridge", "ElasticNet"]
+                            if _TF_OK:
+                                model_choices.append("LSTM")
+                            if _PYCARET_OK:
+                                model_choices.append("PyCaret AutoML")
+
+                            default_models = ["XGBoost", "RandomForest", "ExtraTrees"]
+                            if _TF_OK:
+                                default_models.append("LSTM")
+                            if use_pycaret and _PYCARET_OK:
+                                default_models.append("PyCaret AutoML")
+
+                            models = st.multiselect(
+                                "Models to run",
+                                options=model_choices,
+                                default=[m for m in default_models if m in model_choices],
+                                key="qs_ai_models"
+                            )
+
+                            # Cache forecasts per (ticker, steps, lookback, models)
+                            if "qs_forecast_cache" not in st.session_state:
+                                st.session_state["qs_forecast_cache"] = {}
+                            if "qs_forecasts" not in st.session_state:
+                                st.session_state["qs_forecasts"] = {}
+
+                            cache_key = f"{pick}|lb={int(lookback)}|st={int(steps)}|m={','.join(models)}|pyc={int(use_pycaret)}"
+                            run_now = st.button("RUN / REFRESH FORECAST", key="qs_ai_run_btn")
+
+                            if run_now or cache_key not in st.session_state["qs_forecast_cache"]:
                                 try:
-                                    forecast_dict = self.ai.run_prediction(price_data[pick])
-                                    f_df = pd.DataFrame(forecast_dict)
-                                    st.session_state["qs_forecasts"][pick] = f_df
+                                    forecasts, meta = self.ai.run_prediction(
+                                        price_data[pick],
+                                        steps=int(steps),
+                                        models=models,
+                                        use_pycaret=bool(use_pycaret),
+                                        return_meta=True,
+                                    )
+                                    st.session_state["qs_forecast_cache"][cache_key] = (forecasts, meta)
+                                    st.session_state["qs_forecasts"][pick] = pd.DataFrame(forecasts) if isinstance(forecasts, dict) else None
                                 except Exception as e:
                                     st.error(f"Forecast failed: {e}")
-                                    f_df = None
-                            if f_df is not None:
-                                st.line_chart(f_df)
+                                    st.session_state["qs_forecast_cache"][cache_key] = ({}, {"notes": [str(e)]})
+
+                            forecasts, meta = st.session_state["qs_forecast_cache"].get(cache_key, ({}, {}))
+
+                            # Display
+                            if forecasts:
+                                last_dt = price_data.index[-1]
+                                try:
+                                    future_idx = pd.bdate_range(last_dt, periods=int(steps) + 1)[1:]
+                                except Exception:
+                                    future_idx = pd.date_range(last_dt, periods=int(steps) + 1, freq="D")[1:]
+
+                                fdf = pd.DataFrame({k: np.asarray(v).reshape(-1) for k, v in forecasts.items()}, index=future_idx)
+
+                                hist = price_data[pick].dropna()
+                                hist_tail = hist.tail(320)
+
+                                fig = go.Figure()
+                                fig.add_trace(go.Scatter(x=hist_tail.index, y=hist_tail.values, name="History", mode="lines"))
+
+                                # Forecast paths
+                                for col in fdf.columns:
+                                    fig.add_trace(go.Scatter(x=fdf.index, y=fdf[col].values, name=col, mode="lines"))
+
+                                # Light confidence band around ensemble if available
+                                try:
+                                    if "Ensemble" in fdf.columns and len(hist_tail) > 30:
+                                        rets = hist_tail.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
+                                        vol_ann = float(rets.std(ddof=1) * np.sqrt(252)) if rets.shape[0] > 10 else np.nan
+                                        if np.isfinite(vol_ann):
+                                            sigma_d = vol_ann / np.sqrt(252)
+                                            ens = fdf["Ensemble"].astype(float)
+                                            upper = ens * (1.0 + sigma_d)
+                                            lower = ens * (1.0 - sigma_d)
+
+                                            fig.add_trace(go.Scatter(
+                                                x=fdf.index, y=upper.values, mode="lines",
+                                                line=dict(width=1, dash="dot"), name="Ensemble +1σ", showlegend=False
+                                            ))
+                                            fig.add_trace(go.Scatter(
+                                                x=fdf.index, y=lower.values, mode="lines",
+                                                line=dict(width=1, dash="dot"), name="Ensemble -1σ", showlegend=False
+                                            ))
+                                            x_band = list(fdf.index) + list(fdf.index[::-1])
+                                            y_band = list(upper.values) + list(lower.values[::-1])
+                                            fig.add_trace(go.Scatter(
+                                                x=x_band, y=y_band, fill="toself", opacity=0.12,
+                                                line=dict(width=0), name="Band", showlegend=False
+                                            ))
+                                except Exception:
+                                    pass
+
+                                fig.update_layout(
+                                    template="plotly_dark",
+                                    height=560,
+                                    title=f"Forecast Paths — {pick} (lookback={int(lookback)}, steps={int(steps)})",
+                                    xaxis_title="Date",
+                                    yaxis_title="Price",
+                                    margin=dict(l=10, r=10, t=60, b=10),
+                                    legend_title="Model"
+                                )
+                                st.plotly_chart(fig, use_container_width=True, key="qs_ai_forecast_fig")
+
+                                st.markdown("#### Forecast Table (future path values)")
+                                st.dataframe(fdf, use_container_width=True)
+
+                                # Diagnostics
+                                met = (meta or {}).get("metrics", {})
+                                if isinstance(met, dict) and len(met) > 0:
+                                    rows = []
+                                    for mname, md in met.items():
+                                        if not isinstance(md, dict):
+                                            continue
+                                        r = {"Model": mname}
+                                        r.update({k: md.get(k, np.nan) for k in ["RMSE", "MAE", "R2"]})
+                                        rows.append(r)
+                                    if rows:
+                                        met_df = pd.DataFrame(rows)
+                                        st.markdown("#### Holdout Diagnostics (scaled space)")
+                                        st.dataframe(met_df, use_container_width=True)
+
+                                if _PYCARET_OK and isinstance(meta, dict) and meta.get("pycaret_leaderboard") is not None:
+                                    with st.expander("PyCaret AutoML Leaderboard", expanded=False):
+                                        try:
+                                            st.dataframe(meta["pycaret_leaderboard"], use_container_width=True)
+                                        except Exception:
+                                            st.write(meta["pycaret_leaderboard"])
+
+                                notes = (meta or {}).get("notes", [])
+                                if notes:
+                                    with st.expander("Engine Notes / Warnings", expanded=False):
+                                        for n in notes:
+                                            st.warning(n)
+
+                            else:
+                                st.info("No forecasts to display yet. Click **RUN / REFRESH FORECAST**.")
 
                     with t3:
                         st.markdown("### 🌍 Macro Sensitivity & Cross-Asset Beta")
@@ -6128,7 +6597,8 @@ def main():
         st.error(f"Fatal error: {e}")
         st.code(traceback.format_exc())
 
-# NOTE: Streamlit router below controls which app runs (merged build).
+if __name__ == "__main__":
+    main()
 
 
 # =============================================================================
@@ -7022,72 +7492,18 @@ def _icd_display_reporting_fallback(self, cfg):
 
 def _icd_display_settings_fallback(self, cfg):
     import streamlit as st
-    import pandas as pd
 
     st.markdown("### ⚙️ Settings & Diagnostics")
 
     c1, c2 = st.columns(2)
     with c1:
         st.write("**Core Parameters**")
-
-        # Risk-free rate policy
-        st.markdown("#### Risk-free rate (Rf)")
-        st.caption("Best default for USD portfolios: 3M U.S. T-bill yield (proxy `^IRX`). Keep manual override for non-USD / offline.")
-        rf_source = st.selectbox(
-            "Rf source",
-            options=["Manual", "Fetch from ^IRX (3M T-bill proxy)"],
-            index=0,
-            key="set_rf_source"
-        )
-
-        # Manual input always available (acts as fallback)
-        rf_manual = st.number_input(
-            "Risk-free rate (annual, decimal)",
-            min_value=0.0,
-            max_value=0.2,
-            value=float(getattr(cfg, "risk_free_rate", 0.02)),
-            step=0.001,
-            format="%.3f",
-            key="set_rf"
-        )
-
-        # Optional fetch
-        if rf_source.startswith("Fetch"):
-            st.caption("Click to update Rf from latest `^IRX` close (yield %).")
-            if st.button("Update Rf from ^IRX", key="btn_rf_irx"):
-                try:
-                    import yfinance as yf
-                    irx = yf.download("^IRX", period="30d", interval="1d", progress=False)["Close"].dropna()
-                    if not irx.empty:
-                        rf_val = float(irx.iloc[-1]) / 100.0
-                        cfg.risk_free_rate = rf_val
-                        st.session_state["set_rf"] = rf_val
-                        st.success(f"Rf updated from ^IRX: {rf_val:.2%}")
-                    else:
-                        st.warning("Could not fetch ^IRX (empty). Using manual value.")
-                        cfg.risk_free_rate = float(rf_manual)
-                except Exception as e:
-                    st.warning(f"^IRX fetch failed: {e}. Using manual value.")
-                    cfg.risk_free_rate = float(rf_manual)
-        else:
-            cfg.risk_free_rate = float(rf_manual)
-
-        cfg.rolling_window = st.number_input(
-            "Default rolling window",
-            min_value=20,
-            max_value=500,
-            value=int(getattr(cfg, "rolling_window", 60)),
-            step=1,
-            key="set_rollw"
-        )
-        cfg.backtest_window = st.number_input(
-            "Backtest window",
-            min_value=50,
-            max_value=2000,
-            value=int(getattr(cfg, "backtest_window", 250)),
-            step=10,
-            key="set_btwin"
-        )
+        cfg.risk_free_rate = st.number_input("Risk-free rate", min_value=0.0, max_value=0.2, value=float(getattr(cfg, "risk_free_rate", 0.02)),
+                                             step=0.001, format="%.3f", key="set_rf")
+        cfg.rolling_window = st.number_input("Default rolling window", min_value=10, max_value=500, value=int(getattr(cfg, "rolling_window", 60)),
+                                             step=1, key="set_rollw")
+        cfg.backtest_window = st.number_input("Backtest window", min_value=50, max_value=2000, value=int(getattr(cfg, "backtest_window", 250)),
+                                              step=10, key="set_btwin")
     with c2:
         st.write("**Correlation Policy**")
         st.selectbox(
@@ -7108,10 +7524,9 @@ def _icd_display_settings_fallback(self, cfg):
     deps = {
         "arch (GARCH)": "arch",
         "hmmlearn (HMM regimes)": "hmmlearn",
-        "scikit-learn (Ledoit–Wolf / AI Ridge)": "sklearn",
-        "PyPortfolioOpt (EF/HRP/BL)": "pypfopt",
+        "scikit-learn (Ledoit–Wolf)": "sklearn",
+        "PyPortfolioOpt": "pypfopt",
         "QuantStats": "quantstats",
-        "XGBoost (AI μ optional)": "xgboost",
     }
     status = {}
     for label, mod in deps.items():
@@ -7122,749 +7537,103 @@ def _icd_display_settings_fallback(self, cfg):
             status[label] = "⚠️ missing"
     st.json(status, expanded=False)
 
-
 def _icd_display_portfolio_lab_fallback(self, cfg):
-    """
-    🧰 Portfolio Lab (PyPortfolioOpt • Institutional)
-
-    Adds institutional-grade portfolio strategy tooling on top of the platform:
-    - User-defined weights (table) + performance diagnostics
-    - PyPortfolioOpt strategies (Max Sharpe / Min Vol / Efficient Risk / Efficient Return)
-    - HRP allocation (hierarchical risk parity)
-    - Black–Litterman (views + confidence) for posterior returns
-    - Efficient Frontier chart + Capital Market Line (risk-free aware)
-    - "AI" expected returns option (fast Ridge/XGBoost fallback, cloud-safe)
-
-    Notes:
-    - This page is intentionally defensive against missing optional deps.
-    - It is also defensive against NaNs/misalignment (a major cause of unstable results).
-    """
     import numpy as np
     import pandas as pd
     import streamlit as st
-    import plotly.graph_objects as go
 
-    st.markdown("### 🧰 Portfolio Lab (PyPortfolioOpt • Institutional)")
-
-    # -------------------------
-    # Helpers (local to page)
-    # -------------------------
-    def _as_float(x, default=0.0):
-        try:
-            return float(x)
-        except Exception:
-            return float(default)
-
-    def _ann_factor():
-        return float(getattr(cfg, "annual_trading_days", 252) or 252)
-
-    def _clean_returns_df(df: pd.DataFrame) -> pd.DataFrame:
-        if not isinstance(df, pd.DataFrame):
-            return pd.DataFrame()
-        df = df.copy()
-        df = df.sort_index()
-        df = df.apply(pd.to_numeric, errors="coerce")
-        df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.dropna(axis=1, how="all")
-        return df
-
-    def _portfolio_metrics(port_rets: pd.Series, rf: float) -> dict:
-        s = pd.to_numeric(port_rets, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-        if s.empty or len(s) < 20:
-            return {"success": False, "message": "Insufficient portfolio return history."}
-
-        ann = _ann_factor()
-        mu = float(s.mean() * ann)
-        vol = float(s.std(ddof=1) * np.sqrt(ann))
-        sharpe = (mu - rf) / vol if np.isfinite(vol) and vol > 0 else np.nan
-        dd = (s.add(1.0).cumprod() / s.add(1.0).cumprod().cummax() - 1.0)
-        mdd = float(dd.min()) if not dd.empty else np.nan
-        return {
-            "success": True,
-            "annual_return": mu,
-            "annual_volatility": vol,
-            "sharpe": float(sharpe) if np.isfinite(sharpe) else np.nan,
-            "max_drawdown": mdd,
-            "n_obs": int(len(s)),
-        }
-
-    def _normalize_weights(w: pd.Series) -> pd.Series:
-        w = pd.to_numeric(w, errors="coerce").fillna(0.0)
-        s = float(w.sum())
-        if s == 0:
-            return w
-        return w / s
-
-    def _make_cov_matrix(df: pd.DataFrame, shrink: bool, min_periods: int) -> pd.DataFrame:
-        """
-        Return annualized covariance matrix.
-        - Uses Ledoit–Wolf shrinkage when available if shrink=True
-        - Else uses sample covariance (pairwise with min_periods)
-        """
-        ann = _ann_factor()
-        # Pairwise covariance with min periods (reduces NaN propagation)
-        cov = df.cov(min_periods=int(min_periods)) * ann
-
-        if not shrink:
-            return cov
-
-        # Ledoit–Wolf shrinkage via sklearn if available
-        try:
-            from sklearn.covariance import LedoitWolf  # type: ignore
-            x = df.dropna(how="any")  # LW needs complete cases
-            if x.shape[0] >= max(60, df.shape[1] * 5):
-                lw = LedoitWolf().fit(x.values)
-                cov_lw = pd.DataFrame(lw.covariance_ * ann, index=df.columns, columns=df.columns)
-                return cov_lw
-        except Exception:
-            pass
-
-        return cov
-
-    def _expected_returns(df: pd.DataFrame, rf: float, method: str, bench: pd.Series | None) -> pd.Series:
-        """
-        Expected returns vector (annualized).
-        method: "Historical Mean" | "EWMA Mean" | "CAPM" | "AI (Ridge/XGB)"
-        """
-        ann = _ann_factor()
-        r = df.copy()
-        # Use per-asset mean, robust to NaN
-        if method == "Historical Mean":
-            mu = r.mean(skipna=True) * ann
-            return mu
-
-        if method == "EWMA Mean":
-            span = st.slider("EWMA span (days)", min_value=10, max_value=252, value=60, step=5, key="pylab_ewma_span")
-            mu = r.ewm(span=int(span), adjust=False).mean().iloc[-1] * ann
-            return mu
-
-        if method == "CAPM":
-            if bench is None or bench.dropna().empty:
-                # fallback to historical mean
-                return r.mean(skipna=True) * ann
-
-            b = pd.to_numeric(bench, errors="coerce").replace([np.inf, -np.inf], np.nan)
-            # align
-            aligned = r.join(b.rename("BENCH"), how="inner").dropna(how="any")
-            if aligned.shape[0] < 60:
-                return r.mean(skipna=True) * ann
-
-            bench_r = aligned["BENCH"]
-            mu_b = float(bench_r.mean() * ann)
-
-            betas = {}
-            vb = float(bench_r.var(ddof=1))
-            for c in r.columns:
-                rc = aligned[c]
-                cov = float(np.cov(rc.values, bench_r.values, ddof=1)[0, 1]) if vb > 0 else np.nan
-                beta = cov / vb if np.isfinite(cov) and vb > 0 else np.nan
-                betas[c] = beta
-
-            beta_s = pd.Series(betas).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            # CAPM: E[Ri] = rf + beta*(E[Rm]-rf)
-            mu = rf + beta_s * (mu_b - rf)
-            return mu
-
-        if method == "AI (Ridge/XGB)":
-            # Fast, cloud-safe predictive mean model on lagged returns
-            lags = st.slider("AI lags", min_value=2, max_value=20, value=5, step=1, key="pylab_ai_lags")
-            train_window = st.slider("AI train window (days)", min_value=120, max_value=1500, value=420, step=30, key="pylab_ai_win")
-            model_choice = st.selectbox("AI model", options=["Ridge (fast)", "XGBoost (if available)"], index=0, key="pylab_ai_model")
-
-            mu_pred = {}
-            for c in r.columns:
-                s = pd.to_numeric(r[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-                if len(s) < max(train_window, 120):
-                    mu_pred[c] = float(s.mean() * ann) if len(s) > 20 else 0.0
-                    continue
-
-                s = s.iloc[-int(train_window):]
-                # Build supervised dataset: predict next return from lagged returns
-                X, y = [], []
-                vals = s.values
-                for i in range(int(lags), len(vals) - 1):
-                    X.append(vals[i - int(lags): i])
-                    y.append(vals[i])
-                if len(y) < 50:
-                    mu_pred[c] = float(s.mean() * ann)
-                    continue
-
-                X = np.asarray(X, dtype=float)
-                y = np.asarray(y, dtype=float)
-
-                # Fit model
-                yhat = None
-                if model_choice.startswith("XGBoost"):
-                    try:
-                        from xgboost import XGBRegressor  # type: ignore
-                        mdl = XGBRegressor(
-                            n_estimators=200,
-                            max_depth=3,
-                            learning_rate=0.05,
-                            subsample=0.9,
-                            colsample_bytree=0.9,
-                            random_state=42,
-                        )
-                        mdl.fit(X, y)
-                        yhat = float(mdl.predict(X[-1].reshape(1, -1))[0])
-                    except Exception:
-                        yhat = None
-
-                if yhat is None:
-                    try:
-                        from sklearn.linear_model import Ridge  # type: ignore
-                        mdl = Ridge(alpha=1.0, random_state=42)
-                        mdl.fit(X, y)
-                        yhat = float(mdl.predict(X[-1].reshape(1, -1))[0])
-                    except Exception:
-                        yhat = float(np.mean(y))
-
-                # Predict next-day expected return; annualize
-                # Clamp to a sane range to avoid unstable optimizations from noisy ML estimates.
-                yhat = float(np.clip(yhat, -0.05, 0.05))
-                mu_pred[c] = float(yhat * ann)
-
-            return pd.Series(mu_pred)
-
-        # fallback
-        return r.mean(skipna=True) * ann
-
-    def _try_pypfopt():
-        try:
-            import pypfopt  # noqa: F401
-            return True
-        except Exception:
-            return False
-
-    def _efficient_frontier(mu: pd.Series, S: pd.DataFrame, rf: float, bounds, n_points: int = 50):
-        """
-        Returns a dict with arrays: vol, ret, sharpe and special portfolios.
-        """
-        try:
-            from pypfopt.efficient_frontier import EfficientFrontier
-        except Exception as e:
-            return {"success": False, "message": f"PyPortfolioOpt missing: {e}"}
-
-        # Determine target return range (use robust quantiles)
-        mu_v = mu.astype(float).values
-        mu_min = float(np.nanmin(mu_v))
-        mu_max = float(np.nanmax(mu_v))
-        if not np.isfinite(mu_min) or not np.isfinite(mu_max) or mu_min == mu_max:
-            return {"success": False, "message": "Expected returns are not well-defined for frontier."}
-
-        # Build special portfolios
-        special = {}
-        try:
-            ef = EfficientFrontier(mu, S, weight_bounds=bounds)
-            ef.max_sharpe(risk_free_rate=float(rf))
-            w_ms = ef.clean_weights()
-            pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-            special["max_sharpe"] = {"weights": w_ms, "return": float(pr[0]), "vol": float(pr[1]), "sharpe": float(pr[2])}
-        except Exception:
-            special["max_sharpe"] = None
-
-        try:
-            ef = EfficientFrontier(mu, S, weight_bounds=bounds)
-            ef.min_volatility()
-            w_mv = ef.clean_weights()
-            pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-            special["min_vol"] = {"weights": w_mv, "return": float(pr[0]), "vol": float(pr[1]), "sharpe": float(pr[2])}
-        except Exception:
-            special["min_vol"] = None
-
-        # Frontier points
-        target_rets = np.linspace(mu_min, mu_max, int(n_points))
-        vols, rets, sharpes = [], [], []
-        for tr in target_rets:
-            try:
-                ef = EfficientFrontier(mu, S, weight_bounds=bounds)
-                ef.efficient_return(target_return=float(tr))
-                pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-                rets.append(float(pr[0]))
-                vols.append(float(pr[1]))
-                sharpes.append(float(pr[2]))
-            except Exception:
-                # skip infeasible targets
-                continue
-
-        if len(vols) < 5:
-            return {"success": False, "message": "Frontier could not be computed (infeasible constraints or too little data).", "special": special}
-
-        return {
-            "success": True,
-            "vol": np.asarray(vols, dtype=float),
-            "ret": np.asarray(rets, dtype=float),
-            "sharpe": np.asarray(sharpes, dtype=float),
-            "special": special,
-        }
-
-    # -------------------------
-    # Data selection
-    # -------------------------
+    st.markdown("### 🧰 Portfolio Lab (PyPortfolioOpt • Optional)")
     returns_df = _icd__get_returns_df(self)
-    returns_df = _clean_returns_df(returns_df)
     if returns_df.empty:
         st.info("Load data from the sidebar to begin.")
         return
 
-    all_cols = list(returns_df.columns)
-    default_assets = all_cols[: min(10, len(all_cols))]
-    sel = st.multiselect(
-        "Select assets for portfolio lab",
-        options=all_cols,
-        default=default_assets,
-        key="pylab_assets",
-        help="Pick the assets (and optionally benchmarks) available in returns_df."
-    )
+    assets = list(returns_df.columns)
+    default_assets = assets[: min(10, len(assets))]
+    sel = st.multiselect("Select assets for optimization", assets, default=default_assets, key="pypf_assets")
     if len(sel) < 2:
         st.warning("Select at least 2 assets.")
         return
 
-    raw = returns_df[sel].copy()
-
-    st.caption("Optimization requires a covariance matrix. Choose how strict the missing-data alignment should be.")
-    align_mode = st.selectbox(
-        "Alignment policy",
-        options=[
-            "Listwise (complete cases) — most stable",
-            "Coverage threshold per day — keeps more history",
-        ],
-        index=1,
-        key="pylab_align_mode"
-    )
-
-    if align_mode.startswith("Listwise"):
-        df = raw.dropna(how="any")
-    else:
-        # keep a day if enough assets are present; then drop remaining NaNs via listwise on the kept rows
-        min_frac = st.slider("Minimum fraction of assets present per day", 0.30, 1.00, 0.70, 0.05, key="pylab_min_frac")
-        thresh = int(np.ceil(min_frac * raw.shape[1]))
-        df = raw.dropna(thresh=thresh).dropna(how="any")
-
+    df = returns_df[sel].dropna(how="any")
     if df.shape[0] < 120:
-        st.warning(f"Need at least ~120 aligned observations for portfolio optimization. Current aligned obs: {df.shape[0]}")
-        st.dataframe(df.tail(15), use_container_width=True)
+        st.warning("Need at least ~120 aligned observations for optimization.")
         return
 
-    # Risk-free rate
-    rf = _as_float(getattr(cfg, "risk_free_rate", 0.02), 0.02)
-    st.info(f"Risk-free rate used in Sharpe / frontier: **{rf:.2%}** (configure in ⚙️ Settings).")
+    st.info("If PyPortfolioOpt is not installed in your environment, this tab will auto-fallback to the internal optimizer.")
+    use_pypfopt = st.checkbox("Use PyPortfolioOpt (if available)", value=True, key="pypf_use")
 
-    # Benchmarks: allow CAPM choice if available
-    bench_candidates = [c for c in returns_df.columns if c.upper() in ("SPY", "BCOM", "DBC", "USO", "GLD", "IWM", "QQQ") or c.startswith("^")]
-    bench_default = "SPY" if "SPY" in returns_df.columns else (bench_candidates[0] if bench_candidates else None)
+    if use_pypfopt:
+        try:
+            from pypfopt import expected_returns, risk_models
+            from pypfopt.efficient_frontier import EfficientFrontier
+            from pypfopt import CLA
+            from pypfopt.hierarchical_portfolio import HRPOpt
 
-    # -------------------------
-    # Portfolio Lab Tabs
-    # -------------------------
-    tabA, tabB, tabC, tabD = st.tabs([
-        "📦 Allocation & Strategies",
-        "📉 Efficient Frontier",
-        "🧠 AI Expected Returns",
-        "🧾 Diagnostics",
-    ])
+            mu = expected_returns.mean_historical_return(df, frequency=int(getattr(cfg, "annual_trading_days", 252)))
+            S = risk_models.sample_cov(df, frequency=int(getattr(cfg, "annual_trading_days", 252)))
 
-    with tabA:
-        st.markdown("#### Strategy Selection (Combo Box)")
+            opt_type = st.selectbox(
+                "Optimizer",
+                options=["Max Sharpe", "Min Volatility", "Efficient Risk", "Efficient Return", "CLA (min vol)", "HRP"],
+                index=0,
+                key="pypf_type"
+            )
 
-        use_pypfopt = st.checkbox("Use PyPortfolioOpt (recommended)", value=True, key="pylab_use_pypfopt")
-        if use_pypfopt and not _try_pypfopt():
-            st.warning("PyPortfolioOpt not available. Falling back to internal optimizer. (Install `PyPortfolioOpt` in requirements.txt.)")
+            if opt_type == "HRP":
+                hrp = HRPOpt(df)
+                w = hrp.optimize()
+                w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+                st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+                perf = hrp.portfolio_performance(verbose=False)
+                st.json({"expected_return": perf[0], "volatility": perf[1], "sharpe": perf[2]}, expanded=False)
+                return
+
+            if opt_type.startswith("CLA"):
+                cla = CLA(mu, S)
+                w = cla.min_volatility()
+                w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+                st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+                perf = cla.portfolio_performance(verbose=False)
+                st.json({"expected_return": perf[0], "volatility": perf[1], "sharpe": perf[2]}, expanded=False)
+                return
+
+            ef = EfficientFrontier(mu, S)
+
+            if opt_type == "Max Sharpe":
+                ef.max_sharpe(risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.02)))
+            elif opt_type == "Min Volatility":
+                ef.min_volatility()
+            elif opt_type == "Efficient Risk":
+                target_risk = st.slider("Target risk (annual vol)", min_value=0.05, max_value=0.80, value=0.20, step=0.01, key="pypf_trisk")
+                ef.efficient_risk(target_volatility=float(target_risk))
+            elif opt_type == "Efficient Return":
+                target_ret = st.slider("Target return (annual)", min_value=-0.10, max_value=1.00, value=0.15, step=0.01, key="pypf_tret")
+                ef.efficient_return(target_return=float(target_ret))
+
+            w = ef.clean_weights()
+            w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+            st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
+
+            perf = ef.portfolio_performance(verbose=False, risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.02)))
+            st.json({"expected_return": perf[0], "volatility": perf[1], "sharpe": perf[2]}, expanded=False)
+
+        except Exception as e:
+            st.warning(f"PyPortfolioOpt unavailable or failed ({e}). Falling back to internal optimizer.")
             use_pypfopt = False
 
-        # Expected return model
-        mu_method = st.selectbox(
-            "Expected return model",
-            options=["Historical Mean", "EWMA Mean", "CAPM", "AI (Ridge/XGB)"],
-            index=0,
-            key="pylab_mu_method"
-        )
-
-        bench_series = None
-        if mu_method == "CAPM":
-            if bench_default is None:
-                st.warning("No benchmark-like series found in loaded data. CAPM will fallback to Historical Mean.")
-            else:
-                bench_sel = st.selectbox(
-                    "Benchmark for CAPM",
-                    options=bench_candidates if bench_candidates else [bench_default],
-                    index=0,
-                    key="pylab_bench"
-                )
-                if bench_sel in returns_df.columns:
-                    bench_series = returns_df[bench_sel]
-
-        # Covariance
-        st.markdown("#### Covariance Model")
-        shrink = st.checkbox("Ledoit–Wolf shrinkage (if sklearn available)", value=True, key="pylab_shrink")
-        min_periods = st.slider("Min overlap per pair (cov)", min_value=30, max_value=252, value=90, step=5, key="pylab_cov_minp")
-        S = _make_cov_matrix(df, shrink=bool(shrink), min_periods=int(min_periods))
-
-        # Weight bounds
-        st.markdown("#### Weight Constraints")
-        allow_short = st.checkbox("Allow shorting", value=False, key="pylab_short")
-        if allow_short:
-            bounds = (-1.0, 1.0)
+    if not use_pypfopt:
+        method = st.selectbox("Internal optimizer method", options=["sharpe", "min_var", "max_ret"], index=0, key="pypf_int_method")
+        try:
+            out = self.analytics.optimize_portfolio(df, method=method)
+        except Exception as e:
+            out = {"success": False, "message": str(e)}
+        if out.get("success", False):
+            w = out.get("weights", {})
+            w_df = pd.DataFrame({"Weight": w}).sort_values("Weight", ascending=False)
+            st.dataframe(w_df.style.format({"Weight":"{:.2%}"}), use_container_width=True)
         else:
-            wmax = st.slider("Max weight per asset", min_value=0.05, max_value=1.00, value=0.35, step=0.05, key="pylab_wmax")
-            bounds = (0.0, float(wmax))
-
-        # Weight input / strategy selection
-        strategy = st.selectbox(
-            "Portfolio strategy (selection criteria)",
-            options=[
-                "User Weights (no optimization)",
-                "User Weights + Optimize around my weights",
-                "Equal Weight",
-                "Optimize: Max Sharpe (Tangency)",
-                "Optimize: Min Volatility",
-                "Optimize: Efficient Risk",
-                "Optimize: Efficient Return",
-                "HRP (Hierarchical Risk Parity)",
-                "Black–Litterman (views)",
-            ],
-            index=3,
-            key="pylab_strategy"
-        )
-
-        # User weights editor (always available)
-        w0 = pd.Series(1.0 / df.shape[1], index=df.columns, name="Weight")
-        user_df = pd.DataFrame({"Asset": w0.index, "Weight": w0.values})
-        user_df = st.data_editor(
-            user_df,
-            use_container_width=True,
-            num_rows="fixed",
-            key="pylab_weight_editor"
-        )
-        w_user = pd.Series(user_df["Weight"].values, index=user_df["Asset"].values)
-        w_user = _normalize_weights(w_user)
-
-        st.caption("Tip: If your user weights don't sum to 1, the system normalizes them automatically.")
-        st.write("**Normalized user weights**")
-        st.dataframe(pd.DataFrame({"Weight": w_user}).style.format({"Weight": "{:.2%}"}), use_container_width=True)
-
-        # Compute expected returns
-        mu = _expected_returns(df, rf=rf, method=str(mu_method), bench=bench_series)
-        mu = mu.reindex(df.columns).fillna(0.0)
-
-        # Execute strategy
-        result = {"success": False, "message": "No result."}
-
-        if strategy.startswith("User Weights (no optimization)"):
-            port = df @ w_user.values
-            result = {"success": True, "weights": dict(w_user), "metrics": _portfolio_metrics(port, rf)}
-
-        elif strategy.startswith("Equal Weight"):
-            w_eq = pd.Series(1.0 / df.shape[1], index=df.columns)
-            port = df @ w_eq.values
-            result = {"success": True, "weights": dict(w_eq), "metrics": _portfolio_metrics(port, rf)}
-
-        elif strategy.startswith("User Weights + Optimize"):
-            # Bound each weight around the user's choice
-            tol = st.slider("User-weight tolerance (+/-)", min_value=0.00, max_value=0.50, value=0.10, step=0.01, key="pylab_wtol")
-            per_asset_bounds = []
-            for a in df.columns:
-                wv = float(w_user.get(a, 0.0))
-                lb = max(bounds[0], wv - tol)
-                ub = min(bounds[1], wv + tol)
-                per_asset_bounds.append((lb, ub))
-
-            if use_pypfopt:
-                try:
-                    from pypfopt.efficient_frontier import EfficientFrontier
-                    ef = EfficientFrontier(mu, S, weight_bounds=per_asset_bounds)
-                    ef.max_sharpe(risk_free_rate=float(rf))
-                    w = ef.clean_weights()
-                    pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-                    result = {
-                        "success": True,
-                        "weights": w,
-                        "performance": {"expected_return": float(pr[0]), "volatility": float(pr[1]), "sharpe": float(pr[2])},
-                        "note": "Optimized with per-asset bounds centered on user weights."
-                    }
-                except Exception as e:
-                    result = {"success": False, "message": str(e)}
-            else:
-                # internal optimizer fallback uses global bounds; user-centered bounds are not supported here
-                try:
-                    out = self.analytics.optimize_portfolio(df, method="sharpe")
-                    result = out
-                except Exception as e:
-                    result = {"success": False, "message": str(e)}
-
-        elif strategy.startswith("Optimize:"):
-            if use_pypfopt:
-                try:
-                    from pypfopt.efficient_frontier import EfficientFrontier
-                    ef = EfficientFrontier(mu, S, weight_bounds=bounds)
-
-                    if "Max Sharpe" in strategy:
-                        ef.max_sharpe(risk_free_rate=float(rf))
-                    elif "Min Volatility" in strategy:
-                        ef.min_volatility()
-                    elif "Efficient Risk" in strategy:
-                        target_risk = st.slider("Target risk (annual volatility)", min_value=0.05, max_value=0.80, value=0.20, step=0.01, key="pylab_trisk")
-                        ef.efficient_risk(target_volatility=float(target_risk))
-                    elif "Efficient Return" in strategy:
-                        target_ret = st.slider("Target return (annual)", min_value=-0.10, max_value=1.00, value=0.15, step=0.01, key="pylab_tret")
-                        ef.efficient_return(target_return=float(target_ret))
-
-                    w = ef.clean_weights()
-                    pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-
-                    result = {"success": True, "weights": w, "performance": {"expected_return": float(pr[0]), "volatility": float(pr[1]), "sharpe": float(pr[2])}}
-                except Exception as e:
-                    result = {"success": False, "message": str(e)}
-            else:
-                # internal optimizer
-                method_map = {
-                    "Optimize: Max Sharpe (Tangency)": "sharpe",
-                    "Optimize: Min Volatility": "min_var",
-                    "Optimize: Efficient Risk": "min_var",
-                    "Optimize: Efficient Return": "max_ret",
-                }
-                method = method_map.get(strategy, "sharpe")
-                try:
-                    out = self.analytics.optimize_portfolio(df, method=method)
-                    result = out
-                except Exception as e:
-                    result = {"success": False, "message": str(e)}
-
-        elif strategy.startswith("HRP"):
-            if not use_pypfopt:
-                st.warning("HRP requires PyPortfolioOpt. Install it and re-enable PyPortfolioOpt.")
-            else:
-                try:
-                    from pypfopt.hierarchical_portfolio import HRPOp
-                    hrp = HRPOp(df)  # HRP expects returns
-                    w = hrp.optimize()
-                    # Evaluate with simple realized metrics
-                    w_s = pd.Series(w).reindex(df.columns).fillna(0.0)
-                    w_s = _normalize_weights(w_s)
-                    port = df @ w_s.values
-                    result = {"success": True, "weights": dict(w_s), "metrics": _portfolio_metrics(port, rf), "note": "HRP uses realized-return metrics."}
-                except Exception as e:
-                    result = {"success": False, "message": str(e)}
-
-        elif strategy.startswith("Black"):
-            if not use_pypfopt:
-                st.warning("Black–Litterman requires PyPortfolioOpt. Install it and re-enable PyPortfolioOpt.")
-            else:
-                try:
-                    from pypfopt.black_litterman import BlackLittermanModel, market_implied_risk_aversion, market_implied_prior_returns
-                    from pypfopt.efficient_frontier import EfficientFrontier
-
-                    # Market proxy: use equal-weight "market" unless a benchmark is available
-                    market_col = bench_default if bench_default in returns_df.columns else None
-                    if market_col is None:
-                        st.caption("No market proxy (benchmark) detected — using equal-weight proxy as 'market'.")
-                        market_prices_like = (df.add(1.0).cumprod())
-                        # Prior returns from historical mean
-                        prior = mu
-                        delta = 2.5
-                    else:
-                        market_r = pd.to_numeric(returns_df[market_col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-                        # A simple delta approximation from market returns
-                        delta = float(market_implied_risk_aversion(market_r, risk_free_rate=float(rf)))
-                        prior = mu  # keep prior from chosen mu model
-
-                    tau = st.slider("Tau (BL uncertainty scalar)", min_value=0.01, max_value=0.50, value=0.05, step=0.01, key="pylab_bl_tau")
-                    st.markdown("##### Views (optional)")
-                    st.caption("Add simple absolute views (annual returns) on selected assets. Leave empty to use prior.")
-                    view_assets = st.multiselect("View assets", options=list(df.columns), default=[], key="pylab_view_assets")
-
-                    Q = {}
-                    if view_assets:
-                        for a in view_assets:
-                            Q[a] = st.slider(f"View: E[{a}] (annual return)", min_value=-0.50, max_value=1.00, value=float(mu.get(a, 0.10)), step=0.01, key=f"pylab_view_{a}")
-
-                    if not Q:
-                        # No views => just optimize on prior
-                        ef = EfficientFrontier(mu, S, weight_bounds=bounds)
-                        ef.max_sharpe(risk_free_rate=float(rf))
-                        w = ef.clean_weights()
-                        pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-                        result = {"success": True, "weights": w, "performance": {"expected_return": float(pr[0]), "volatility": float(pr[1]), "sharpe": float(pr[2])}, "note": "No views provided; optimized using prior returns."}
-                    else:
-                        # Build P matrix for absolute views: each view references one asset
-                        assets_idx = list(df.columns)
-                        P = np.zeros((len(Q), len(assets_idx)))
-                        q_vec = np.zeros(len(Q))
-                        for i, (a, v) in enumerate(Q.items()):
-                            P[i, assets_idx.index(a)] = 1.0
-                            q_vec[i] = float(v)
-
-                        bl = BlackLittermanModel(S, pi=prior, P=P, Q=q_vec, tau=float(tau))
-                        bl_mu = bl.bl_returns()
-                        ef = EfficientFrontier(bl_mu, S, weight_bounds=bounds)
-                        ef.max_sharpe(risk_free_rate=float(rf))
-                        w = ef.clean_weights()
-                        pr = ef.portfolio_performance(verbose=False, risk_free_rate=float(rf))
-                        result = {"success": True, "weights": w, "performance": {"expected_return": float(pr[0]), "volatility": float(pr[1]), "sharpe": float(pr[2])}, "note": "Black–Litterman posterior optimized (max Sharpe)."}
-                except Exception as e:
-                    result = {"success": False, "message": str(e)}
-
-        # Present result
-        st.markdown("#### Result")
-        if result.get("success", False):
-            w = result.get("weights", {}) or {}
-            if isinstance(w, dict) and w:
-                w_df = pd.DataFrame({"Weight": pd.Series(w)}).sort_values("Weight", ascending=False)
-                st.dataframe(w_df.style.format({"Weight": "{:.2%}"}), use_container_width=True)
-
-            if "performance" in result:
-                st.json(result.get("performance", {}), expanded=False)
-            if "metrics" in result:
-                st.json(result.get("metrics", {}), expanded=False)
-
-            if result.get("note"):
-                st.caption(result["note"])
-        else:
-            st.warning(result.get("message", "No solution."))
-
-    with tabB:
-        st.markdown("#### Efficient Frontier (risk-free aware)")
-        if not _try_pypfopt():
-            st.info("Install PyPortfolioOpt to compute the efficient frontier chart.")
-        else:
-            # Recompute mu/S with current selections
-            mu_method = st.session_state.get("pylab_mu_method", "Historical Mean")
-            bench_sel = st.session_state.get("pylab_bench", bench_default)
-            bench_series = returns_df[bench_sel] if (mu_method == "CAPM" and bench_sel in returns_df.columns) else None
-
-            mu = _expected_returns(df, rf=rf, method=str(mu_method), bench=bench_series)
-            mu = mu.reindex(df.columns).fillna(0.0)
-
-            shrink = bool(st.session_state.get("pylab_shrink", True))
-            min_periods = int(st.session_state.get("pylab_cov_minp", 90))
-            S = _make_cov_matrix(df, shrink=shrink, min_periods=min_periods)
-
-            allow_short = bool(st.session_state.get("pylab_short", False))
-            if allow_short:
-                bounds = (-1.0, 1.0)
-            else:
-                wmax = float(st.session_state.get("pylab_wmax", 0.35))
-                bounds = (0.0, float(wmax))
-
-            pts = st.slider("Frontier points", min_value=20, max_value=120, value=60, step=10, key="pylab_front_pts")
-
-            out = _efficient_frontier(mu, S, rf=rf, bounds=bounds, n_points=int(pts))
-            if not out.get("success", False):
-                st.warning(out.get("message", "Frontier not available."))
-                st.json({"hint": "Try relaxing weight bounds / disabling shorting / increasing aligned data."}, expanded=False)
-            else:
-                vol = out["vol"]
-                ret = out["ret"]
-                sharpe = out["sharpe"]
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=vol, y=ret,
-                    mode="markers",
-                    name="Efficient Frontier",
-                    marker=dict(size=7),
-                    text=[f"Sharpe: {s:.2f}" for s in sharpe]
-                ))
-
-                # Risk-free point
-                fig.add_trace(go.Scatter(
-                    x=[0.0], y=[rf],
-                    mode="markers",
-                    name="Risk-free",
-                    marker=dict(size=10, symbol="diamond")
-                ))
-
-                # Special points
-                sp = out.get("special", {}) or {}
-                ms = sp.get("max_sharpe")
-                mv = sp.get("min_vol")
-
-                if ms:
-                    fig.add_trace(go.Scatter(
-                        x=[ms["vol"]], y=[ms["return"]],
-                        mode="markers",
-                        name="Max Sharpe (Tangency)",
-                        marker=dict(size=12, symbol="star")
-                    ))
-                    # Capital Market Line
-                    # line from (0, rf) to tangency
-                    x_line = np.array([0.0, ms["vol"]], dtype=float)
-                    y_line = rf + (ms["return"] - rf) / ms["vol"] * x_line if ms["vol"] > 0 else np.array([rf, rf], dtype=float)
-                    fig.add_trace(go.Scatter(
-                        x=x_line, y=y_line,
-                        mode="lines",
-                        name="Capital Market Line",
-                    ))
-
-                if mv:
-                    fig.add_trace(go.Scatter(
-                        x=[mv["vol"]], y=[mv["return"]],
-                        mode="markers",
-                        name="Min Volatility",
-                        marker=dict(size=10, symbol="circle-open")
-                    ))
-
-                fig.update_layout(
-                    height=520,
-                    title="Efficient Frontier (annualized)",
-                    xaxis_title="Volatility (σ)",
-                    yaxis_title="Expected Return (μ)",
-                    hovermode="closest"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-                if ms:
-                    st.markdown("#### Recommended (Sharpe-optimal)")
-                    st.caption("Given the chosen risk-free rate, the **Max Sharpe (Tangency)** portfolio is the theoretically optimal risky portfolio on the frontier.")
-                    w_ms = ms.get("weights", {})
-                    if w_ms:
-                        st.dataframe(pd.DataFrame({"Weight": pd.Series(w_ms)}).sort_values("Weight", ascending=False).style.format({"Weight":"{:.2%}"}), use_container_width=True)
-                    st.json({"risk_free_rate": rf, "expected_return": ms["return"], "volatility": ms["vol"], "sharpe": ms["sharpe"]}, expanded=False)
-
-    with tabC:
-        st.markdown("#### AI Expected Returns (for optimization)")
-        st.caption("This is a fast, cloud-safe model (Ridge or XGBoost) that estimates next-day return expectations and annualizes them for use in portfolio optimization.")
-        mu_ai = _expected_returns(df, rf=rf, method="AI (Ridge/XGB)", bench=None)
-        mu_ai = mu_ai.reindex(df.columns).fillna(0.0)
-
-        st.write("**AI expected returns (annualized)**")
-        st.dataframe(pd.DataFrame({"AI_mu": mu_ai}).sort_values("AI_mu", ascending=False).style.format({"AI_mu": "{:.2%}"}), use_container_width=True)
-
-        # Quick visualization
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=mu_ai.index.tolist(), y=mu_ai.values.tolist(), name="AI μ"))
-        fig.update_layout(height=420, title="AI Expected Returns (annualized)", xaxis_title="Asset", yaxis_title="μ")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.info("To use AI μ in optimization, go back to 'Allocation & Strategies' and select Expected return model = AI (Ridge/XGB).")
-
-    with tabD:
-        st.markdown("#### Diagnostics")
-        st.write("**Aligned returns preview**")
-        st.dataframe(df.tail(25), use_container_width=True)
-
-        st.write("**NaN coverage (raw)**")
-        miss = raw.isna().mean().sort_values(ascending=False)
-        st.dataframe(pd.DataFrame({"missing_fraction": miss}).style.format({"missing_fraction":"{:.2%}"}), use_container_width=True)
-
-        st.write("**Covariance matrix (annualized)**")
-        st.dataframe(S.style.format("{:.6f}"), use_container_width=True)
-
-        st.write("**Expected returns μ (annualized)**")
-        # show current mu
-        mu_method = st.session_state.get("pylab_mu_method", "Historical Mean")
-        bench_sel = st.session_state.get("pylab_bench", bench_default)
-        bench_series = returns_df[bench_sel] if (mu_method == "CAPM" and bench_sel in returns_df.columns) else None
-        mu_cur = _expected_returns(df, rf=rf, method=str(mu_method), bench=bench_series).reindex(df.columns).fillna(0.0)
-        st.dataframe(pd.DataFrame({"mu": mu_cur}).sort_values("mu", ascending=False).style.format({"mu":"{:.2%}"}), use_container_width=True)
-
-        st.markdown("#### Practical Risk-Free Rate Recommendation")
-        st.write(
-            "- For **USD-denominated** portfolios, the most defensible default is the **3‑month U.S. T‑bill yield** (proxy: `^IRX`).\n"
-            "- Keep a **manual override** in Settings for offline environments or non‑USD contexts.\n"
-            "- For non‑USD portfolios, use a short‑dated government bill/SONIA/€STR equivalent in the portfolio currency."
-        )
-
+            st.warning(out.get("message", "Internal optimizer failed."))
 
 def run_scientific_platform_v7_2_ultra():
     """Wrapper for merged v7.2 Ultra platform."""
@@ -7897,706 +7666,6 @@ except Exception:
     pass
 
 
-
-# =============================================================================
-# USDJPY FZ Reaction Monitor (Michaelis–Menten + Peak-Down) — merged page
-# Source integrated from user-provided script (keys namespaced to avoid collisions)
-# =============================================================================
-
-def run_usdjpy_fz_reaction_monitor():
-    """USDJPY FZ Reaction Monitor — Michaelis–Menten + Peak-Down (merged page)."""
-    # app.py
-    """
-    USDJPY FZ Reaction Monitor — Hybrid Model
-    ========================================
-    Hybrid "macro" model for USDJPY:
-      1) Michaelis–Menten (single-substrate) saturating reaction-speed model
-      2) Peak-Down process: downside spike hazard + expected jump-loss
-
-    "Substrate driver" is built from an explicit FZ (Flow Zone) definition:
-
-    FZ Definition (exact, algorithmic)
-    ----------------------------------
-    For each bar t:
-      - Compute rolling high/low over a lookback window W:
-          H_t = rolling_max(High, W)
-          L_t = rolling_min(Low,  W)
-          R_t = H_t - L_t
-      - Define Flow Zone bounds using Fibonacci retracement band inside that range:
-          FZ_low_t  = L_t + fib_low  * R_t - atr_mult * ATR_t
-          FZ_high_t = L_t + fib_high * R_t + atr_mult * ATR_t
-        where fib_low < fib_high (defaults: 0.382 and 0.618), and ATR is EWMA ATR.
-
-    Interpretation:
-      - FZ is a dynamic "fair-value / flow" band inside the latest range, expanded by ATR buffer.
-      - Reactions are expected near the FZ edges.
-
-    Substrate a_t
-    -------------
-    If Close_t is inside FZ:
-      - edge_pressure_t = 1 - (min(distance to lower edge, distance to upper edge) / half_width)
-        => edge_pressure = 1 at edges, 0 at center
-    Else:
-      - edge_pressure = 0
-
-    Then:
-      - speed_t = |log_return_t| / EWMA_vol_t
-      - a_t = clip(edge_pressure_t * speed_t, 0, a_clip_max)
-
-    Dashboard
-    ---------
-    - Live chart (Plotly): price + FZ band
-    - Risk band + alerts
-    - Signals table + CSV export
-    - Calibration info
-
-    Disclaimer: educational/research tool, not financial advice.
-    """
-
-
-    import time
-    import warnings
-    from dataclasses import dataclass
-    from typing import Optional, Tuple, Dict, Any
-
-    import numpy as np
-    import pandas as pd
-    import streamlit as st
-    import plotly.graph_objects as go
-
-    try:
-        import yfinance as yf
-    except Exception as e:
-        st.error("Missing dependency: yfinance. Add it to requirements.txt.")
-        st.stop()
-
-    try:
-        from scipy.optimize import curve_fit
-    except Exception as e:
-        st.error("Missing dependency: scipy. Add it to requirements.txt.")
-        st.stop()
-
-    # Optional: auto-refresh
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        _HAS_AUTOREFRESH = True
-    except Exception:
-        _HAS_AUTOREFRESH = False
-
-    # Optional: statsmodels for logistic fit
-    try:
-        import statsmodels.api as sm
-        _HAS_STATSMODELS = True
-    except Exception:
-        _HAS_STATSMODELS = False
-
-
-    # -----------------------------------------------------------------------------
-    # App setup
-    # -----------------------------------------------------------------------------
-
-    warnings.filterwarnings("ignore")
-
-
-    # -----------------------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------------------
-    def sigmoid(x: np.ndarray) -> np.ndarray:
-        x = np.clip(x, -50, 50)
-        return 1.0 / (1.0 + np.exp(-x))
-
-
-    def mm_rate(a: np.ndarray, V: float, Km: float) -> np.ndarray:
-        return (V * a) / (Km + a + 1e-12)
-
-
-    def ewma_vol(r: pd.Series, span: int) -> pd.Series:
-        return r.ewm(span=span, adjust=False, min_periods=span).std()
-
-
-    def compute_atr(df: pd.DataFrame, span: int) -> pd.Series:
-        high = df["High"].astype(float)
-        low = df["Low"].astype(float)
-        close = df["Close"].astype(float)
-        prev_close = close.shift(1)
-        tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-        return tr.ewm(span=span, adjust=False, min_periods=span).mean()
-
-
-    def rsi(close: pd.Series, n: int) -> pd.Series:
-        delta = close.diff()
-        up = delta.clip(lower=0.0)
-        down = (-delta).clip(lower=0.0)
-        roll_up = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-        roll_down = down.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
-        rs = roll_up / (roll_down + 1e-12)
-        return 100 - (100 / (1 + rs))
-
-
-    def _fix_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        df = df.rename(columns={c: c.title() for c in df.columns})
-        df.index = pd.to_datetime(df.index)
-        return df
-
-
-    @st.cache_data(ttl=60, show_spinner=False)
-    def fetch_usdjpy(interval: str, period: str, primary: str = "USDJPY=X", fallback: str = "JPY=X") -> pd.DataFrame:
-        """
-        Yahoo Finance FX volume may be NaN; this is OK.
-        For intraday intervals, Yahoo restricts max period (e.g., 15m ~ 60d).
-        """
-        def _dl(ticker: str) -> pd.DataFrame:
-            df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
-            df = _fix_yf_columns(df)
-            if not df.empty:
-                df["Ticker"] = ticker
-            return df
-
-        df = _dl(primary)
-        if df.empty:
-            df = _dl(fallback)
-        if df.empty:
-            raise RuntimeError("Yahoo Finance returned empty data for USDJPY.")
-        # Ensure required columns
-        for c in ["Open", "High", "Low", "Close"]:
-            if c not in df.columns:
-                raise RuntimeError(f"Missing {c} in Yahoo data columns: {list(df.columns)}")
-        return df
-
-
-    # -----------------------------------------------------------------------------
-    # Hybrid model (FZ-driven)
-    # -----------------------------------------------------------------------------
-    @dataclass
-    class FZConfig:
-        lookback: int = 96
-        fib_low: float = 0.382
-        fib_high: float = 0.618
-        atr_span: int = 14
-        atr_mult: float = 0.25
-
-
-    @dataclass
-    class ModelConfig:
-        vol_span: int = 20
-        rsi_window: int = 14
-        ema_fast: int = 12
-        ema_slow: int = 48
-
-        horizon_bars: int = 6
-        jump_quantile: float = 0.995
-        min_train: int = 400
-
-        a_clip: Tuple[float, float] = (0.0, 10.0)
-
-
-    @dataclass
-    class HybridParams:
-        # Michaelis–Menten
-        V: float
-        Km: float
-
-        # Peak-down logistic weights
-        w0: float
-        w_upper: float
-        w_rsi: float
-        w_vol: float
-        w_trend: float
-
-        # Jump magnitude
-        jump_mean: float
-
-        # Jump intensity
-        lam0: float
-        lam1: float
-
-
-    def compute_fz(df: pd.DataFrame, fz: FZConfig) -> pd.DataFrame:
-        out = df.copy()
-        atr = compute_atr(out, span=fz.atr_span)
-        roll_high = out["High"].astype(float).rolling(fz.lookback, min_periods=fz.lookback).max()
-        roll_low = out["Low"].astype(float).rolling(fz.lookback, min_periods=fz.lookback).min()
-        rng = (roll_high - roll_low).clip(lower=1e-12)
-
-        fz_low = roll_low + fz.fib_low * rng - fz.atr_mult * atr
-        fz_high = roll_low + fz.fib_high * rng + fz.atr_mult * atr
-
-        # safety: ensure low <= high
-        swap = fz_low > fz_high
-        if swap.any():
-            tmp = fz_low.copy()
-            fz_low = fz_low.where(~swap, fz_high)
-            fz_high = fz_high.where(~swap, tmp)
-
-        out["ATR"] = atr
-        out["FZ_low"] = fz_low
-        out["FZ_high"] = fz_high
-        out["FZ_center"] = (fz_low + fz_high) / 2.0
-        out["FZ_halfw"] = (fz_high - fz_low) / 2.0
-        out["in_FZ"] = (out["Close"].astype(float) >= fz_low) & (out["Close"].astype(float) <= fz_high)
-        return out
-
-
-    def build_features(df: pd.DataFrame, fz_cfg: FZConfig, mcfg: ModelConfig) -> pd.DataFrame:
-        out = compute_fz(df, fz_cfg)
-        close = out["Close"].astype(float)
-        logp = np.log(close.replace(0, np.nan))
-        r = logp.diff()
-
-        vol = ewma_vol(r, span=mcfg.vol_span)
-        rsi_v = rsi(close, n=mcfg.rsi_window)
-
-        ema_fast = close.ewm(span=mcfg.ema_fast, adjust=False, min_periods=mcfg.ema_slow).mean()
-        ema_slow = close.ewm(span=mcfg.ema_slow, adjust=False, min_periods=mcfg.ema_slow).mean()
-        trend = (ema_fast - ema_slow) / (ema_slow + 1e-12)
-
-        # Edge pressure inside FZ: 1 at edges, 0 at center
-        halfw = out["FZ_halfw"].astype(float).replace(0, np.nan)
-        dist_to_low = (close - out["FZ_low"].astype(float)).abs()
-        dist_to_high = (out["FZ_high"].astype(float) - close).abs()
-        dist_edge = np.minimum(dist_to_low, dist_to_high)
-        edge_pressure = (1.0 - (dist_edge / (halfw + 1e-12))).clip(0.0, 1.0)
-        edge_pressure = edge_pressure.where(out["in_FZ"], 0.0)
-
-        # Upper-edge pressure (0..1) used for peak-down (downside) bias
-        z = ((close - out["FZ_center"].astype(float)) / (halfw + 1e-12)).clip(-1.0, 1.0)  # -1..1
-        upper_edge = np.maximum(z, 0.0)  # 0..1 when above center
-        upper_edge = pd.Series(upper_edge, index=out.index).where(out["in_FZ"], 0.0)
-
-        speed = (r.abs() / (vol + 1e-12)).clip(0.0, mcfg.a_clip[1])
-        a = (edge_pressure * speed).clip(mcfg.a_clip[0], mcfg.a_clip[1])
-
-        out["logp"] = logp
-        out["r"] = r
-        out["vol"] = vol
-        out["rsi"] = rsi_v
-        out["trend"] = trend
-        out["edge_pressure"] = edge_pressure
-        out["upper_edge"] = upper_edge
-        out["speed"] = speed
-        out["a"] = a
-
-        out["fwd_r"] = out["r"].shift(-mcfg.horizon_bars)
-        return out
-
-
-    def fit_hybrid(feats: pd.DataFrame, mcfg: ModelConfig) -> HybridParams:
-        df = feats.dropna(subset=["r", "vol", "a", "upper_edge", "rsi", "trend", "fwd_r"]).copy()
-        if len(df) < mcfg.min_train:
-            raise ValueError(f"Not enough data to fit. Have {len(df)}, need at least {mcfg.min_train} bars.")
-
-        # 1) Fit Michaelis–Menten on |r| vs a
-        a = df["a"].to_numpy(float)
-        y = df["r"].abs().to_numpy(float)
-
-        V0 = float(np.nanpercentile(y, 95)) if np.isfinite(np.nanpercentile(y, 95)) else 1e-3
-        Km0 = float(np.nanmedian(a[a > 0])) if np.any(a > 0) else 0.5
-
-        bounds = ([1e-12, 1e-6], [np.inf, np.inf])
-        try:
-            (V_hat, Km_hat), _ = curve_fit(mm_rate, a, y, p0=[V0, Km0], bounds=bounds, maxfev=20000)
-        except Exception:
-            V_hat = float(np.nanpercentile(y, 99))
-            Km_hat = float(np.nanmedian(a[a > 0])) if np.any(a > 0) else 0.5
-
-        # 2) Define down-jump threshold from tail of |r|
-        r = df["r"].to_numpy(float)
-        thr = float(np.nanquantile(np.abs(r), mcfg.jump_quantile))
-        is_jump_down = (r < -thr).astype(int)
-
-        down_tail = -r[r < -thr]  # positive magnitudes
-        jump_mean = float(np.nanmean(down_tail)) if len(down_tail) > 5 else float(thr)
-
-        # 3) Peak-down events: price in FZ and near upper edge + forward drop
-        k = 2.0
-        peak_down = ((df["upper_edge"] > 0.25) & (df["fwd_r"] < -k * df["vol"])).astype(int)
-
-        # Logistic model on:
-        #  - upper_edge
-        #  - RSI overbought (normalized)
-        #  - vol deviation
-        #  - trend (negative trend increases peak-down probability)
-        X = np.column_stack([
-            np.ones(len(df)),
-            df["upper_edge"].to_numpy(float),
-            (df["rsi"].to_numpy(float) - 50.0) / 10.0,
-            (df["vol"].to_numpy(float) / (df["vol"].median() + 1e-12)) - 1.0,
-            df["trend"].to_numpy(float),
-        ])
-        y_pd = peak_down.to_numpy(int)
-
-        w = np.array([-2.0, 3.5, 1.0, 0.8, -2.0], dtype=float)  # sensible defaults
-        if _HAS_STATSMODELS:
-            try:
-                model = sm.Logit(y_pd, X)
-                res = model.fit(disp=False, maxiter=200)
-                w = res.params.astype(float)
-            except Exception:
-                pass
-
-        # 4) Jump intensity λ ≈ lam0 + lam1 * a
-        a_clip = np.clip(a, 0, mcfg.a_clip[1])
-        yj = is_jump_down.astype(float)
-        A = np.column_stack([np.ones_like(a_clip), a_clip])
-        try:
-            lam_hat, *_ = np.linalg.lstsq(A, yj, rcond=None)
-            lam0, lam1 = float(max(lam_hat[0], 1e-8)), float(max(lam_hat[1], 0.0))
-        except Exception:
-            lam0, lam1 = 1e-4, 1e-3
-
-        return HybridParams(
-            V=float(V_hat), Km=float(Km_hat),
-            w0=float(w[0]), w_upper=float(w[1]), w_rsi=float(w[2]), w_vol=float(w[3]), w_trend=float(w[4]),
-            jump_mean=float(jump_mean),
-            lam0=float(lam0), lam1=float(lam1),
-        )
-
-
-    def predict_hybrid(feats: pd.DataFrame, params: HybridParams, mcfg: ModelConfig) -> pd.DataFrame:
-        df = feats.copy()
-
-        a = df["a"].fillna(0.0).to_numpy(float)
-        mm = mm_rate(a, params.V, params.Km)
-        df["mm_speed"] = mm
-
-        X = np.column_stack([
-            np.ones(len(df)),
-            df["upper_edge"].fillna(0.0).to_numpy(float),
-            (df["rsi"].fillna(50.0).to_numpy(float) - 50.0) / 10.0,
-            (df["vol"].fillna(df["vol"].median()).to_numpy(float) / (df["vol"].median() + 1e-12)) - 1.0,
-            df["trend"].fillna(0.0).to_numpy(float),
-        ])
-        logits = X @ np.array([params.w0, params.w_upper, params.w_rsi, params.w_vol, params.w_trend], dtype=float)
-        p_peakdown = sigmoid(logits)
-        df["p_peakdown"] = p_peakdown
-
-        lam = np.clip(params.lam0 + params.lam1 * np.clip(a, 0, mcfg.a_clip[1]), 0, 0.5)
-        df["lambda_down"] = lam
-        p_jump = 1.0 - np.exp(-lam)
-        df["p_jump_down"] = p_jump
-
-        # Direction gate: within FZ, if close is above center (upper_edge>0) bias to downside; else trend-follow.
-        trend_sign = np.sign(df["trend"].fillna(0.0).to_numpy(float))
-        in_fz = df["in_FZ"].fillna(False).to_numpy(bool)
-        upper = df["upper_edge"].fillna(0.0).to_numpy(float) > 0.35
-        sign = np.where(in_fz & upper, -1.0, np.where(trend_sign == 0, 1.0, trend_sign))
-        df["dir"] = sign
-
-        exp_jump_loss = p_peakdown * p_jump * params.jump_mean
-        df["exp_jump_loss"] = exp_jump_loss
-        df["mu_hat"] = sign * mm - exp_jump_loss
-
-        # Composite downside risk score
-        score = 100.0 * np.clip(0.65 * p_peakdown + 0.35 * p_jump, 0.0, 1.0)
-        df["risk_score"] = score
-        return df
-
-
-    # -----------------------------------------------------------------------------
-    # Plotting
-    # -----------------------------------------------------------------------------
-    def make_price_chart(df: pd.DataFrame, show_markers: bool = True) -> go.Figure:
-        fig = go.Figure()
-
-        fig.add_trace(go.Candlestick(
-            x=df.index,
-            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-            name="USDJPY",
-            increasing_line_width=1,
-            decreasing_line_width=1,
-        ))
-
-        # FZ band
-        if "FZ_low" in df.columns and "FZ_high" in df.columns:
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df["FZ_high"],
-                mode="lines", line=dict(width=1),
-                name="FZ High",
-            ))
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df["FZ_low"],
-                mode="lines", line=dict(width=1),
-                fill="tonexty",
-                name="FZ Low (band)",
-                opacity=0.15,
-            ))
-
-        if show_markers and "risk_score" in df.columns:
-            # Mark red/orange signals on close
-            latest_n = min(300, len(df))
-            sub = df.tail(latest_n).copy()
-            red = sub[sub["risk_score"] >= 75]
-            org = sub[(sub["risk_score"] >= 50) & (sub["risk_score"] < 75)]
-            if not red.empty:
-                fig.add_trace(go.Scatter(
-                    x=red.index, y=red["Close"],
-                    mode="markers", name="High Risk",
-                    marker=dict(size=7, symbol="triangle-down"),
-                ))
-            if not org.empty:
-                fig.add_trace(go.Scatter(
-                    x=org.index, y=org["Close"],
-                    mode="markers", name="Medium Risk",
-                    marker=dict(size=6, symbol="circle"),
-                    opacity=0.7,
-                ))
-
-        fig.update_layout(
-            height=560,
-            margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_title="Time",
-            yaxis_title="USDJPY",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        return fig
-
-
-    def make_risk_chart(df: pd.DataFrame) -> go.Figure:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=df["risk_score"], mode="lines", name="Risk Score (0-100)"))
-        # Horizontal bands
-        fig.add_hrect(y0=0, y1=50, opacity=0.08, line_width=0)
-        fig.add_hrect(y0=50, y1=75, opacity=0.12, line_width=0)
-        fig.add_hrect(y0=75, y1=100, opacity=0.16, line_width=0)
-
-        fig.update_layout(
-            height=260,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(range=[0, 100], title="Risk"),
-            xaxis_title="Time",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        return fig
-
-
-    def make_prob_chart(df: pd.DataFrame) -> go.Figure:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=df["p_peakdown"], mode="lines", name="P(peak-down)"))
-        fig.add_trace(go.Scatter(x=df.index, y=df["p_jump_down"], mode="lines", name="P(down-jump)"))
-        fig.update_layout(
-            height=260,
-            margin=dict(l=10, r=10, t=30, b=10),
-            yaxis=dict(range=[0, 1], title="Probability"),
-            xaxis_title="Time",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        return fig
-
-
-    # -----------------------------------------------------------------------------
-    # Alerts
-    # -----------------------------------------------------------------------------
-    def render_alerts(latest: pd.Series) -> None:
-        risk = float(latest.get("risk_score", np.nan))
-        p_pd = float(latest.get("p_peakdown", np.nan))
-        p_jd = float(latest.get("p_jump_down", np.nan))
-        a = float(latest.get("a", np.nan))
-
-        if not np.isfinite(risk):
-            return
-
-        if risk >= 85 and p_pd >= 0.60:
-            st.error(f"🚨 HIGH ALERT: Downside reaction risk is EXTREME (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
-        elif risk >= 75:
-            st.warning(f"⚠️ Warning: Downside reaction risk is HIGH (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
-        elif risk >= 50:
-            st.info(f"🟠 Watch: Medium risk (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
-        else:
-            st.success(f"🟢 Normal: Low risk (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
-
-
-    # -----------------------------------------------------------------------------
-    # Sidebar controls
-    # -----------------------------------------------------------------------------
-    with st.sidebar:
-        st.title("⚙️ Controls")
-
-        colA, colB = st.columns(2)
-        with colA:
-            interval = st.selectbox("Interval", ["15m", "30m", "1h", "2h", "4h", "1d"], index=2, key="usdjpy_interval")
-        with colB:
-            # Suggest compatible periods
-            period = st.selectbox("Period", ["60d", "180d", "365d", "730d", "max"], index=3, key="usdjpy_period")
-
-        st.divider()
-        st.subheader("FZ Definition (exact)")
-        lookback = st.slider("FZ lookback (bars)", 48, 300, 96, 6, key="usdjpy_fz_lookback")
-        fib_low = st.number_input("fib_low", min_value=0.05, max_value=0.49, value=0.382, step=0.001, format="%.3f", key="usdjpy_fib_low")
-        fib_high = st.number_input("fib_high", min_value=0.51, max_value=0.95, value=0.618, step=0.001, format="%.3f", key="usdjpy_fib_high")
-        atr_span = st.slider("ATR span", 5, 50, 14, 1, key="usdjpy_atr_span")
-        atr_mult = st.slider("ATR buffer multiplier", 0.0, 2.0, 0.25, 0.05, key="usdjpy_atr_mult")
-
-        st.divider()
-        st.subheader("Model")
-        vol_span = st.slider("EWMA vol span", 10, 80, 20, 1, key="usdjpy_vol_span")
-        rsi_window = st.slider("RSI window", 7, 30, 14, 1, key="usdjpy_rsi_window")
-        ema_fast = st.slider("EMA fast", 4, 30, 12, 1, key="usdjpy_ema_fast")
-        ema_slow = st.slider("EMA slow", 20, 120, 48, 1, key="usdjpy_ema_slow")
-
-        horizon_bars = st.slider("Peak-down horizon (bars)", 1, 24, 6, 1, key="usdjpy_horizon_bars")
-        jump_q = st.slider("Jump quantile", 0.950, 0.999, 0.995, 0.001, key="usdjpy_jump_q")
-        a_clip_max = st.slider("Substrate clip max", 2.0, 20.0, 10.0, 0.5, key="usdjpy_a_clip_max")
-
-        st.divider()
-        st.subheader("Live / Alerts")
-        use_autorefresh = st.checkbox("Auto-refresh", value=False, key="usdjpy_autorefresh")
-        refresh_sec = st.slider("Refresh (seconds)", 10, 300, 30, 5, key="usdjpy_refresh_sec")
-        last_n_chart = st.slider("Bars on charts", 150, 1200, 450, 50, key="usdjpy_last_n_chart")
-
-        st.caption("Tip: intraday intervals often require short periods (e.g., 15m with 60d).")
-
-
-    # Auto-refresh
-    if use_autorefresh and _HAS_AUTOREFRESH:
-        st_autorefresh(interval=int(refresh_sec * 1000), limit=None, key="usdjpy_auto_rerun")
-    elif use_autorefresh and not _HAS_AUTOREFRESH:
-        st.info("Auto-refresh needs streamlit-autorefresh. Add it to requirements.txt (already included in the provided file).")
-
-
-    # -----------------------------------------------------------------------------
-    # Main run
-    # -----------------------------------------------------------------------------
-    st.title("📈 USDJPY FZ Reaction Monitor — Michaelis–Menten + Peak-Down")
-
-    with st.expander("Model summary (what you are monitoring)", expanded=False):
-        st.markdown(
-            """
-    - **FZ (Flow Zone)** is computed from a rolling range (**High/Low lookback**) and a **fib retracement band**, expanded by an **ATR buffer**.
-    - **Substrate a(t)** rises when price is **inside the FZ and close to the edges**, while price is moving fast (vol-adjusted).
-    - **Michaelis–Menten** saturates the reaction speed: higher a(t) increases expected move magnitude, but with diminishing returns.
-    - **Peak-down** module estimates downside reaction probability near the **upper side of the FZ**, plus tail-jump risk.
-            """
-        )
-
-    # Fetch and compute
-    with st.spinner("Fetching USDJPY and computing signals..."):
-        raw = fetch_usdjpy(interval=interval, period=period)
-        fz_cfg = FZConfig(lookback=int(lookback), fib_low=float(fib_low), fib_high=float(fib_high), atr_span=int(atr_span), atr_mult=float(atr_mult))
-        mcfg = ModelConfig(
-            vol_span=int(vol_span), rsi_window=int(rsi_window),
-            ema_fast=int(ema_fast), ema_slow=int(ema_slow),
-            horizon_bars=int(horizon_bars), jump_quantile=float(jump_q),
-            a_clip=(0.0, float(a_clip_max)),
-        )
-        feats = build_features(raw, fz_cfg, mcfg)
-
-        # Fit only on sufficiently clean region; show fit diagnostics
-        try:
-            params = fit_hybrid(feats, mcfg)
-        except Exception as e:
-            st.error(f"Model fit failed: {e}")
-            st.stop()
-
-        scored = predict_hybrid(feats, params, mcfg)
-
-    # Slice for charts
-    plot_df = scored.dropna(subset=["Close"]).tail(int(last_n_chart)).copy()
-
-    # KPIs
-    latest = scored.dropna(subset=["mu_hat", "risk_score"]).iloc[-1]
-
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Close", f"{latest['Close']:.4f}")
-    k2.metric("In FZ", "Yes" if bool(latest.get("in_FZ", False)) else "No")
-    k3.metric("Substrate a(t)", f"{latest.get('a', np.nan):.2f}")
-    k4.metric("MM speed", f"{latest.get('mm_speed', np.nan):.6f}")
-    k5.metric("μ̂ (next-bar)", f"{latest.get('mu_hat', np.nan):.6f}")
-    k6.metric("Risk score", f"{latest.get('risk_score', np.nan):.1f}")
-
-    render_alerts(latest)
-
-    # Layout: charts + signal panels
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Price & FZ", "🧠 Signals", "🧪 Calibration", "📋 Data"])
-
-    with tab1:
-        st.plotly_chart(make_price_chart(plot_df, show_markers=True), use_container_width=True)
-        st.plotly_chart(make_risk_chart(plot_df.dropna(subset=["risk_score"])), use_container_width=True)
-
-    with tab2:
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.plotly_chart(make_prob_chart(plot_df.dropna(subset=["p_peakdown", "p_jump_down"])), use_container_width=True)
-        with c2:
-            st.subheader("Latest signal breakdown")
-            st.write({
-                "timestamp": str(latest.name),
-                "ticker": str(raw["Ticker"].iloc[-1]),
-                "in_FZ": bool(latest.get("in_FZ", False)),
-                "FZ_low": float(latest.get("FZ_low", np.nan)),
-                "FZ_high": float(latest.get("FZ_high", np.nan)),
-                "edge_pressure": float(latest.get("edge_pressure", np.nan)),
-                "upper_edge": float(latest.get("upper_edge", np.nan)),
-                "a": float(latest.get("a", np.nan)),
-                "mm_speed": float(latest.get("mm_speed", np.nan)),
-                "p_peakdown": float(latest.get("p_peakdown", np.nan)),
-                "p_jump_down": float(latest.get("p_jump_down", np.nan)),
-                "exp_jump_loss": float(latest.get("exp_jump_loss", np.nan)),
-                "mu_hat": float(latest.get("mu_hat", np.nan)),
-                "risk_score": float(latest.get("risk_score", np.nan)),
-            })
-
-        st.divider()
-        st.subheader("Band zones (green/orange/red)")
-        st.markdown(
-            """
-    - **Green:** risk < 50  
-    - **Orange:** 50 ≤ risk < 75  
-    - **Red:** risk ≥ 75  
-    You can tighten/loosen these by adjusting the model thresholds (risk chart + markers are based on these cutoffs).
-            """
-        )
-
-    with tab3:
-        st.subheader("Fitted parameters")
-        st.code(
-            f"V={params.V:.6g}, Km={params.Km:.6g}\n"
-            f"Logit weights: w0={params.w0:.4f}, w_upper={params.w_upper:.4f}, w_rsi={params.w_rsi:.4f}, "
-            f"w_vol={params.w_vol:.4f}, w_trend={params.w_trend:.4f}\n"
-            f"Jump mean (down tail)={params.jump_mean:.6g}\n"
-            f"Jump intensity: lam0={params.lam0:.6g}, lam1={params.lam1:.6g}",
-            language="text"
-        )
-
-        st.subheader("Quick sanity plots (last 500 bars)")
-        tmp = scored.dropna(subset=["a", "mm_speed", "r"]).tail(500).copy()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=tmp.index, y=tmp["a"], mode="lines", name="a(t) substrate"))
-        fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="a(t)")
-        st.plotly_chart(fig, use_container_width=True)
-
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=tmp.index, y=tmp["r"].abs(), mode="lines", name="|r|"))
-        fig2.add_trace(go.Scatter(x=tmp.index, y=tmp["mm_speed"], mode="lines", name="MM fitted speed"))
-        fig2.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="log-return")
-        st.plotly_chart(fig2, use_container_width=True)
-
-        st.caption("If MM speed lags too much, increase vol span or adjust FZ buffer/edges so a(t) reacts more selectively.")
-
-    with tab4:
-        st.subheader("Signals table")
-        show_cols = [
-            "Open", "High", "Low", "Close",
-            "FZ_low", "FZ_high", "in_FZ",
-            "a", "mm_speed", "p_peakdown", "p_jump_down", "mu_hat", "risk_score",
-        ]
-        tbl = scored[show_cols].dropna(subset=["Close"]).tail(300).copy()
-        st.dataframe(tbl, use_container_width=True, height=520)
-
-        st.download_button(
-            "Download CSV (last 300 rows)",
-            data=tbl.to_csv(index=True).encode("utf-8"),
-            file_name="usdjpy_fz_mm_peakdown_signals.csv",
-            mime="text/csv",
-            key="usdjpy_dl_csv",
-        )
-
-    st.divider()
-    st.caption("Educational/research dashboard. Not financial advice.")
-
 def _run_app_router():
     import streamlit as st
 
@@ -8606,8 +7675,7 @@ def _run_app_router():
         options=[
             "🏛️ Institutional Commodities Platform (v6.x)",
             "🧪 Scientific Commodities Platform (v7.2 Ultra)",
-            "🧠 Quantum Sovereign Terminal (v14.0)",
-            "💱 USDJPY FZ Reaction Monitor (MM + Peak-Down)",
+            "🧠 Quantum Sovereign Terminal (v14.0)"
         ],
         index=0,
         key="app_mode_selector"
@@ -8617,8 +7685,6 @@ def _run_app_router():
         run_quantum_sovereign_v14_terminal()
     elif mode == "🧪 Scientific Commodities Platform (v7.2 Ultra)":
         run_scientific_platform_v7_2_ultra()
-    elif mode == "💱 USDJPY FZ Reaction Monitor (MM + Peak-Down)":
-        run_usdjpy_fz_reaction_monitor()
     else:
         # Ensure InstitutionalCommoditiesDashboard exists and is runnable
         try:
