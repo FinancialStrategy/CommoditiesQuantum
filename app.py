@@ -1,4 +1,3 @@
-
 """
 🏛️ Institutional Commodities Analytics Platform v6.1
 Integrated Portfolio Analytics • Advanced GARCH & Regime Detection • Machine Learning • Professional Reporting
@@ -5913,6 +5912,23 @@ class ScientificCommoditiesPlatform:
         self.analytics = ScientificAnalyticsEngine(self.cfg)
         self.viz = ScientificVisualizationEngine(self.cfg)
 
+        # --- Widget key namespace (prevents StreamlitDuplicateElementKey in merged / repeated renders)
+        # Stable across reruns (stored in session_state), but unique if the Scientific platform is instantiated
+        # more than once in the same script execution (build_seq).
+        import uuid as _uuid
+        global _SCI_BUILD_SEQ
+        try:
+            _SCI_BUILD_SEQ += 1
+        except NameError:
+            _SCI_BUILD_SEQ = 1
+        self._build_seq = _SCI_BUILD_SEQ
+        _base_ns = st.session_state.get("__sci_widget_ns")
+        if not _base_ns:
+            _base_ns = "sci_" + _uuid.uuid4().hex[:8]
+            st.session_state["__sci_widget_ns"] = _base_ns
+        self.key_ns = f"{_base_ns}_{self._build_seq}"
+
+
         if "selected_assets" not in st.session_state:
             st.session_state.selected_assets = ["GC=F", "SI=F", "CL=F", "HG=F"]
         if "selected_benchmarks" not in st.session_state:
@@ -5926,6 +5942,10 @@ class ScientificCommoditiesPlatform:
             st.session_state.te_thresholds = {"green_max": self.cfg.te_green_max, "orange_max": self.cfg.te_orange_max}
         if "relrisk_thresholds" not in st.session_state:
             st.session_state.relrisk_thresholds = {"green_max": self.cfg.relvar_green_max, "orange_max": self.cfg.relvar_orange_max}
+
+    def _k(self, name: str) -> str:
+        """Namespaced widget key (Scientific mode)."""
+        return f"{self.key_ns}__{name}"
 
     def render_sidebar(self):
         st.sidebar.markdown("## ⚙️ Configuration")
@@ -5941,7 +5961,7 @@ class ScientificCommoditiesPlatform:
             ],
             default=default_assets,
             help="Commodities futures (Yahoo tickers). Add/remove as needed.",
-            key="assets_multiselect"
+            key=self._k("assets_multiselect")
         )
         if len(assets) == 0:
             assets = default_assets
@@ -5952,12 +5972,12 @@ class ScientificCommoditiesPlatform:
             "Benchmark (market proxy for Beta/Treynor/IR/TE/Relative Risk)",
             options=["^GSPC", "^NDX", "DXY", "XU100.IS", "^BSESN", "^N225"],
             index=0,
-            key="benchmark_select"
+            key=self._k("benchmark_select")
         )
         st.session_state.selected_benchmarks = [bench]
 
         st.sidebar.markdown("### 🗓️ Time Range")
-        lookback_years = st.sidebar.slider("Lookback Years", 1, 15, int(self.cfg.lookback_years), 1, key="lookback_years")
+        lookback_years = st.sidebar.slider("Lookback Years", 1, 15, int(self.cfg.lookback_years), 1, key=self._k("lookback_years"))
         self.cfg.lookback_years = lookback_years
 
         st.sidebar.markdown("### 🔗 Correlation Controls")
@@ -5966,41 +5986,41 @@ class ScientificCommoditiesPlatform:
             options=["pearson", "spearman", "kendall", "ewma", "ledoit_wolf"],
             index=0,
             help="ledoit_wolf requires scikit-learn. ewma uses decay lambda.",
-            key="corr_method"
+            key=self._k("corr_method")
         )
         self.cfg.correlation_method = corr_method
-        self.cfg.ensure_psd_corr = st.sidebar.checkbox("Force PSD correlation", value=True, key="psd_corr")
+        self.cfg.ensure_psd_corr = st.sidebar.checkbox("Force PSD correlation", value=True, key=self._k("psd_corr"))
         if corr_method == "ewma":
-            self.cfg.ewma_lambda = st.sidebar.slider("EWMA Lambda (decay)", 0.80, 0.99, float(self.cfg.ewma_lambda), 0.01, key="ewma_lambda")
+            self.cfg.ewma_lambda = st.sidebar.slider("EWMA Lambda (decay)", 0.80, 0.99, float(self.cfg.ewma_lambda), 0.01, key=self._k("ewma_lambda"))
 
         st.sidebar.markdown("### 📉 VaR / CVaR / ES")
-        self.cfg.var_confidence = st.sidebar.slider("Confidence Level", 0.90, 0.99, float(self.cfg.var_confidence), 0.01, key="var_conf")
-        self.cfg.var_horizon_days = st.sidebar.slider("Horizon (days)", 1, 20, int(self.cfg.var_horizon_days), 1, key="var_hor")
-        self.cfg.use_student_t_parametric = st.sidebar.checkbox("Student-t Parametric VaR", value=True, key="use_t")
+        self.cfg.var_confidence = st.sidebar.slider("Confidence Level", 0.90, 0.99, float(self.cfg.var_confidence), 0.01, key=self._k("var_conf"))
+        self.cfg.var_horizon_days = st.sidebar.slider("Horizon (days)", 1, 20, int(self.cfg.var_horizon_days), 1, key=self._k("var_hor"))
+        self.cfg.use_student_t_parametric = st.sidebar.checkbox("Student-t Parametric VaR", value=True, key=self._k("use_t"))
 
         st.sidebar.markdown("### 🧮 Rolling Windows")
-        self.cfg.rolling_beta_window = st.sidebar.slider("Rolling Beta Window (days)", 20, 252, int(self.cfg.rolling_beta_window), 1, key="beta_win")
-        self.cfg.tracking_error_window = st.sidebar.slider("Tracking Error Window (days)", 20, 252, int(self.cfg.tracking_error_window), 1, key="te_win")
+        self.cfg.rolling_beta_window = st.sidebar.slider("Rolling Beta Window (days)", 20, 252, int(self.cfg.rolling_beta_window), 1, key=self._k("beta_win"))
+        self.cfg.tracking_error_window = st.sidebar.slider("Tracking Error Window (days)", 20, 252, int(self.cfg.tracking_error_window), 1, key=self._k("te_win"))
 
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 🟢🟠🔴 Vol Ratio Risk Bands")
-        gmax = st.sidebar.slider("Green max threshold (Ratio)", 0.10, 1.00, float(st.session_state.vol_ratio_thresholds.get("green_max", 0.35)), 0.01, key="vr_green")
-        omax = st.sidebar.slider("Orange max threshold (Ratio)", min(1.50, gmax + 0.01), 1.50, max(float(st.session_state.vol_ratio_thresholds.get("orange_max", 0.55)), gmax + 0.01), 0.01, key="vr_orange")
+        gmax = st.sidebar.slider("Green max threshold (Ratio)", 0.10, 1.00, float(st.session_state.vol_ratio_thresholds.get("green_max", 0.35)), 0.01, key=self._k("vr_green"))
+        omax = st.sidebar.slider("Orange max threshold (Ratio)", min(1.50, gmax + 0.01), 1.50, max(float(st.session_state.vol_ratio_thresholds.get("orange_max", 0.55)), gmax + 0.01), 0.01, key=self._k("vr_orange"))
         st.session_state.vol_ratio_thresholds = {"green_max": gmax, "orange_max": omax}
 
         st.sidebar.markdown("### 🟢🟠🔴 Tracking Error Bands (Annualized)")
-        tg = st.sidebar.slider("Green max (TE)", 0.01, 0.20, float(st.session_state.te_thresholds.get("green_max", 0.04)), 0.005, key="te_green")
-        to = st.sidebar.slider("Orange max (TE)", min(0.30, tg + 0.005), 0.30, max(float(st.session_state.te_thresholds.get("orange_max", 0.08)), tg + 0.005), 0.005, key="te_orange")
+        tg = st.sidebar.slider("Green max (TE)", 0.01, 0.20, float(st.session_state.te_thresholds.get("green_max", 0.04)), 0.005, key=self._k("te_green"))
+        to = st.sidebar.slider("Orange max (TE)", min(0.30, tg + 0.005), 0.30, max(float(st.session_state.te_thresholds.get("orange_max", 0.08)), tg + 0.005), 0.005, key=self._k("te_orange"))
         st.session_state.te_thresholds = {"green_max": tg, "orange_max": to}
 
         st.sidebar.markdown("### 🟢🟠🔴 Relative Risk Bands (Annualized %)")
-        rg = st.sidebar.slider("Green max (Relative risk %)", 0.25, 5.0, float(st.session_state.relrisk_thresholds.get("green_max", 1.0)), 0.05, key="rr_green")
-        ro = st.sidebar.slider("Orange max (Relative risk %)", min(10.0, rg + 0.05), 10.0, max(float(st.session_state.relrisk_thresholds.get("orange_max", 2.0)), rg + 0.05), 0.05, key="rr_orange")
+        rg = st.sidebar.slider("Green max (Relative risk %)", 0.25, 5.0, float(st.session_state.relrisk_thresholds.get("green_max", 1.0)), 0.05, key=self._k("rr_green"))
+        ro = st.sidebar.slider("Orange max (Relative risk %)", min(10.0, rg + 0.05), 10.0, max(float(st.session_state.relrisk_thresholds.get("orange_max", 2.0)), rg + 0.05), 0.05, key=self._k("rr_orange"))
         st.session_state.relrisk_thresholds = {"green_max": rg, "orange_max": ro}
 
         st.sidebar.markdown("---")
         st.sidebar.markdown("### ▶️ Execute")
-        run = st.sidebar.button("Run Scientific Analysis", key="run_analysis_btn")
+        run = st.sidebar.button("Run Scientific Analysis", key=self._k("run_analysis_btn"))
         return run
 
     def run_scientific_analysis(self):
@@ -6307,7 +6327,7 @@ class ScientificCommoditiesPlatform:
             st.warning("No features available.")
             return
 
-        symbol = st.selectbox("Select Asset for Signal", options=symbols, index=0, key="vol_ratio_symbol")
+        symbol = st.selectbox("Select Asset for Signal", options=symbols, index=0, key=self._k("vol_ratio_symbol"))
         df = features.get(symbol, pd.DataFrame())
         if df is None or df.empty:
             st.warning("No data for selected asset.")
@@ -6398,7 +6418,7 @@ class ScientificCommoditiesPlatform:
             st.warning("Tracking error series not available (need benchmark + enough data).")
             return
         symbols = list(te_map.keys())
-        symbol = st.selectbox("Select Asset", options=symbols, index=0, key="te_symbol")
+        symbol = st.selectbox("Select Asset", options=symbols, index=0, key=self._k("te_symbol"))
         te_series = te_map.get(symbol, pd.Series(dtype=float))
         thr = st.session_state.get("te_thresholds", {"green_max": 0.04, "orange_max": 0.08})
         green_max, orange_max = float(thr.get("green_max", 0.04)), float(thr.get("orange_max", 0.08))
@@ -6452,7 +6472,7 @@ class ScientificCommoditiesPlatform:
             st.warning("Rolling beta not available (need benchmark + enough data).")
             return
         symbols = list(beta_map.keys())
-        symbol = st.selectbox("Select Asset", options=symbols, index=0, key="beta_symbol")
+        symbol = st.selectbox("Select Asset", options=symbols, index=0, key=self._k("beta_symbol"))
         beta = beta_map.get(symbol, pd.Series(dtype=float))
         if beta is None or beta.dropna().empty:
             st.warning("No rolling beta data for this asset.")
@@ -6502,7 +6522,7 @@ class ScientificCommoditiesPlatform:
         if not symbols:
             st.warning("No relative risk frames computed.")
             return
-        symbol = st.selectbox("Select Asset", options=symbols, index=0, key="rel_symbol")
+        symbol = st.selectbox("Select Asset", options=symbols, index=0, key=self._k("rel_symbol"))
         df = rel_map.get(symbol, pd.DataFrame())
         if df is None or df.empty:
             st.warning("Not enough data for rolling relative risk. Increase lookback or reduce window.")
@@ -6894,17 +6914,17 @@ def _icd_display_advanced_analytics_fallback(self, cfg):
         options=["Equal-Weight Portfolio", "Single Asset"],
         index=0,
         horizontal=True,
-        key="adv_scope"
+        key=self._k("adv_scope")
     )
 
     if scope.startswith("Equal"):
         assets = list(returns_df.columns)
         default_assets = assets[: min(6, len(assets))]
-        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="adv_assets")
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key=self._k("adv_assets"))
         series = _icd__equal_weight_portfolio(returns_df, sel)
         label = "EW Portfolio"
     else:
-        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="adv_asset")
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key=self._k("adv_asset"))
         series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
         label = sym
 
@@ -6950,7 +6970,7 @@ def _icd_display_advanced_analytics_fallback(self, cfg):
 
     # GARCH (optional)
     st.markdown("#### 📉 Volatility Modeling (GARCH)")
-    garch_on = st.checkbox("Run GARCH(1,1) volatility estimate", value=False, key="adv_garch_on")
+    garch_on = st.checkbox("Run GARCH(1,1) volatility estimate", value=False, key=self._k("adv_garch_on"))
     if garch_on:
         try:
             out = self.analytics.garch_analysis(s_aligned, p=1, q=1)
@@ -6967,7 +6987,7 @@ def _icd_display_advanced_analytics_fallback(self, cfg):
 
     # Regime detection (optional)
     st.markdown("#### 🧩 Regime Detection (HMM optional)")
-    reg_on = st.checkbox("Run regime detection (HMM if available)", value=False, key="adv_regime_on")
+    reg_on = st.checkbox("Run regime detection (HMM if available)", value=False, key=self._k("adv_regime_on"))
     if reg_on:
         try:
             reg = self.analytics.detect_regimes(s_aligned, n_states=int(getattr(cfg, "regime_states", 3)))
@@ -7003,7 +7023,7 @@ def _icd_display_risk_analytics_fallback(self, cfg):
         "Correlation type",
         options=["pearson", "spearman", "kendall"],
         index=0,
-        key="risk_corr_simple_kind"
+        key=self._k("risk_corr_simple_kind")
     )
     min_obs = st.slider(
         "Minimum overlapping observations (min_periods)",
@@ -7011,7 +7031,7 @@ def _icd_display_risk_analytics_fallback(self, cfg):
         max_value=300,
         value=60,
         step=5,
-        key="risk_corr_simple_minobs"
+        key=self._k("risk_corr_simple_minobs")
     )
 
     corr_assets = [c for c in returns_df.columns if c is not None]
@@ -7051,17 +7071,17 @@ def _icd_display_risk_analytics_fallback(self, cfg):
         options=["Equal-Weight Portfolio", "Single Asset"],
         index=0,
         horizontal=True,
-        key="risk_scope"
+        key=self._k("risk_scope")
     )
 
     if scope.startswith("Equal"):
         assets = list(returns_df.columns)
         default_assets = assets[: min(6, len(assets))]
-        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="risk_assets")
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key=self._k("risk_assets"))
         series = _icd__equal_weight_portfolio(returns_df, sel)
         label = "EW Portfolio"
     else:
-        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="risk_asset")
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key=self._k("risk_asset"))
         series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
         label = sym
 
@@ -7071,11 +7091,11 @@ def _icd_display_risk_analytics_fallback(self, cfg):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        cl = st.select_slider("Confidence", options=[0.90, 0.95, 0.99], value=0.95, key="risk_cl")
+        cl = st.select_slider("Confidence", options=[0.90, 0.95, 0.99], value=0.95, key=self._k("risk_cl"))
     with c2:
-        method = st.selectbox("Method", options=["historical", "parametric", "modified"], index=0, key="risk_var_method")
+        method = st.selectbox("Method", options=["historical", "parametric", "modified"], index=0, key=self._k("risk_var_method"))
     with c3:
-        horizon = st.select_slider("Horizon (days)", options=[1, 5, 10, 20], value=1, key="risk_horizon")
+        horizon = st.select_slider("Horizon (days)", options=[1, 5, 10, 20], value=1, key=self._k("risk_horizon"))
 
     try:
         out = self.analytics.calculate_var(series, confidence_level=float(cl), method=method, horizon=int(horizon)) or {}
@@ -7132,17 +7152,17 @@ def _icd_display_ewma_ratio_signal_fallback(self, cfg):
         options=["Equal-Weight Portfolio", "Single Asset"],
         index=0,
         horizontal=True,
-        key="sig_scope"
+        key=self._k("sig_scope")
     )
 
     if scope.startswith("Equal"):
         assets = list(returns_df.columns)
         default_assets = assets[: min(6, len(assets))]
-        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="sig_assets")
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key=self._k("sig_assets"))
         series = _icd__equal_weight_portfolio(returns_df, sel)
         label = "EW Portfolio"
     else:
-        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="sig_asset")
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key=self._k("sig_asset"))
         series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
         label = sym
 
@@ -7152,23 +7172,23 @@ def _icd_display_ewma_ratio_signal_fallback(self, cfg):
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        span_fast = st.number_input("Fast span", min_value=5, max_value=120, value=22, step=1, key="sig_span_fast")
+        span_fast = st.number_input("Fast span", min_value=5, max_value=120, value=22, step=1, key=self._k("sig_span_fast"))
     with c2:
-        span_mid = st.number_input("Mid span", min_value=5, max_value=240, value=33, step=1, key="sig_span_mid")
+        span_mid = st.number_input("Mid span", min_value=5, max_value=240, value=33, step=1, key=self._k("sig_span_mid"))
     with c3:
-        span_slow = st.number_input("Slow span", min_value=10, max_value=500, value=99, step=1, key="sig_span_slow")
+        span_slow = st.number_input("Slow span", min_value=10, max_value=500, value=99, step=1, key=self._k("sig_span_slow"))
     with c4:
-        annualize = st.checkbox("Annualize vols", value=False, key="sig_annualize")
+        annualize = st.checkbox("Annualize vols", value=False, key=self._k("sig_annualize"))
 
     bb1, bb2, bb3, bb4 = st.columns(4)
     with bb1:
-        bb_window = st.number_input("BB window", min_value=5, max_value=120, value=20, step=1, key="sig_bb_window")
+        bb_window = st.number_input("BB window", min_value=5, max_value=120, value=20, step=1, key=self._k("sig_bb_window"))
     with bb2:
-        bb_k = st.number_input("BB k", min_value=0.5, max_value=5.0, value=2.0, step=0.1, key="sig_bb_k")
+        bb_k = st.number_input("BB k", min_value=0.5, max_value=5.0, value=2.0, step=0.1, key=self._k("sig_bb_k"))
     with bb3:
-        green_max = st.number_input("Green max", min_value=0.0, max_value=5.0, value=0.35, step=0.01, key="sig_green")
+        green_max = st.number_input("Green max", min_value=0.0, max_value=5.0, value=0.35, step=0.01, key=self._k("sig_green"))
     with bb4:
-        red_min = st.number_input("Red min", min_value=0.0, max_value=5.0, value=0.55, step=0.01, key="sig_red")
+        red_min = st.number_input("Red min", min_value=0.0, max_value=5.0, value=0.55, step=0.01, key=self._k("sig_red"))
 
     ewma_df = self.analytics.compute_ewma_volatility_ratio(
         series,
@@ -7231,7 +7251,7 @@ def _icd_display_portfolio_fallback(self, cfg):
 
     assets = list(returns_df.columns)
     default_assets = assets[: min(8, len(assets))]
-    sel = st.multiselect("Portfolio Assets", assets, default=default_assets, key="port_assets")
+    sel = st.multiselect("Portfolio Assets", assets, default=default_assets, key=self._k("port_assets"))
     if not sel:
         st.warning("Select at least one asset.")
         return
@@ -7246,8 +7266,8 @@ def _icd_display_portfolio_fallback(self, cfg):
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Optimizer (Internal Engine)")
-    method = st.selectbox("Optimization Method", options=["sharpe", "min_var", "max_ret"], index=0, key="port_opt_method")
-    target = st.number_input("Target annual return (optional)", min_value=0.0, max_value=2.0, value=0.0, step=0.01, key="port_target")
+    method = st.selectbox("Optimization Method", options=["sharpe", "min_var", "max_ret"], index=0, key=self._k("port_opt_method"))
+    target = st.number_input("Target annual return (optional)", min_value=0.0, max_value=2.0, value=0.0, step=0.01, key=self._k("port_target"))
     target_val = None if target <= 0 else float(target)
 
     try:
@@ -7289,16 +7309,16 @@ def _icd_display_rolling_beta_fallback(self, cfg):
         options=["Equal-Weight Portfolio", "Single Asset"],
         index=0,
         horizontal=True,
-        key="beta_scope"
+        key=self._k("beta_scope")
     )
     if scope.startswith("Equal"):
         assets = list(returns_df.columns)
         default_assets = assets[: min(6, len(assets))]
-        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="beta_assets")
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key=self._k("beta_assets"))
         series = _icd__equal_weight_portfolio(returns_df, sel)
         label = "EW Portfolio"
     else:
-        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="beta_asset")
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key=self._k("beta_asset"))
         series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
         label = sym
 
@@ -7311,7 +7331,7 @@ def _icd_display_rolling_beta_fallback(self, cfg):
     series = series.loc[idx]
     bench = bench_series.loc[idx]
 
-    window = st.select_slider("Rolling window (days)", options=[20, 40, 60, 90, 120, 180, 252], value=int(getattr(cfg, "rolling_window", 60)), key="beta_window")
+    window = st.select_slider("Rolling window (days)", options=[20, 40, 60, 90, 120, 180, 252], value=int(getattr(cfg, "rolling_window", 60)), key=self._k("beta_window"))
 
     # rolling beta via covariance
     cov = series.rolling(window).cov(bench)
@@ -7365,15 +7385,15 @@ def _icd_display_stress_testing_fallback(self, cfg):
         st.info("Load data from the sidebar to begin.")
         return
 
-    scope = st.radio("Scope", options=["Equal-Weight Portfolio", "Single Asset"], index=0, horizontal=True, key="st_scope")
+    scope = st.radio("Scope", options=["Equal-Weight Portfolio", "Single Asset"], index=0, horizontal=True, key=self._k("st_scope"))
     if scope.startswith("Equal"):
         assets = list(returns_df.columns)
         default_assets = assets[: min(6, len(assets))]
-        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="st_assets")
+        sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key=self._k("st_assets"))
         series = _icd__equal_weight_portfolio(returns_df, sel)
         label = "EW Portfolio"
     else:
-        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="st_asset")
+        sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key=self._k("st_asset"))
         series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
         label = sym
 
@@ -7381,8 +7401,8 @@ def _icd_display_stress_testing_fallback(self, cfg):
         st.warning("Insufficient history for stress testing (need ~120+ observations).")
         return
 
-    shock = st.select_slider("Shock (return)", options=[-0.30, -0.20, -0.15, -0.10, -0.05, 0.05, 0.10], value=-0.10, key="st_shock")
-    duration = st.select_slider("Shock duration (days)", options=[1, 5, 10, 20], value=5, key="st_duration")
+    shock = st.select_slider("Shock (return)", options=[-0.30, -0.20, -0.15, -0.10, -0.05, 0.05, 0.10], value=-0.10, key=self._k("st_shock"))
+    duration = st.select_slider("Shock duration (days)", options=[1, 5, 10, 20], value=5, key=self._k("st_duration"))
 
     try:
         out = self.analytics.stress_test(series, shock=float(shock), duration=int(duration))
@@ -7446,7 +7466,7 @@ def _icd_display_reporting_fallback(self, cfg):
 
         # CSV download
         csv = df.to_csv().encode("utf-8")
-        st.download_button("⬇️ Download Metrics CSV", data=csv, file_name="performance_metrics.csv", mime="text/csv", key="rep_csv")
+        st.download_button("⬇️ Download Metrics CSV", data=csv, file_name="performance_metrics.csv", mime="text/csv", key=self._k("rep_csv"))
 
         # Excel download
         bio = BytesIO()
@@ -7457,25 +7477,25 @@ def _icd_display_reporting_fallback(self, cfg):
             with writer_obj as writer:
                 df.to_excel(writer, sheet_name="metrics")
         st.download_button("⬇️ Download Metrics Excel", data=bio.getvalue(), file_name="performance_metrics.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_xlsx")
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=self._k("rep_xlsx"))
     else:
         st.warning("No metrics computed (data too short?).")
 
     st.markdown("#### QuantStats Report (optional)")
-    qs_on = st.checkbox("Generate QuantStats HTML report (if installed)", value=False, key="rep_qs_on")
+    qs_on = st.checkbox("Generate QuantStats HTML report (if installed)", value=False, key=self._k("rep_qs_on"))
     if qs_on:
         try:
             import quantstats as qs
             # Choose scope
-            scope = st.radio("QS Scope", options=["Equal-Weight Portfolio", "Single Asset"], index=0, horizontal=True, key="rep_qs_scope")
+            scope = st.radio("QS Scope", options=["Equal-Weight Portfolio", "Single Asset"], index=0, horizontal=True, key=self._k("rep_qs_scope"))
             if scope.startswith("Equal"):
                 assets = list(returns_df.columns)
                 default_assets = assets[: min(6, len(assets))]
-                sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key="rep_qs_assets")
+                sel = st.multiselect("Assets (equal weight)", assets, default=default_assets, key=self._k("rep_qs_assets"))
                 series = _icd__equal_weight_portfolio(returns_df, sel)
                 label = "EW Portfolio"
             else:
-                sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key="rep_qs_asset")
+                sym = st.selectbox("Select Asset", options=list(returns_df.columns), index=0, key=self._k("rep_qs_asset"))
                 series = pd.to_numeric(returns_df[sym], errors="coerce").dropna()
                 label = sym
 
@@ -7485,7 +7505,7 @@ def _icd_display_reporting_fallback(self, cfg):
 
             html = qs.reports.html(series, output=None, title=f"QuantStats Report — {label}", download_filename=None)
             st.download_button("⬇️ Download QuantStats HTML", data=html.encode("utf-8"), file_name=f"quantstats_{label}.html",
-                               mime="text/html", key="rep_qs_dl")
+                               mime="text/html", key=self._k("rep_qs_dl"))
             st.success("Report generated.")
         except Exception as e:
             st.warning(f"QuantStats not available or failed: {e}")
@@ -7499,26 +7519,26 @@ def _icd_display_settings_fallback(self, cfg):
     with c1:
         st.write("**Core Parameters**")
         cfg.risk_free_rate = st.number_input("Risk-free rate", min_value=0.0, max_value=0.2, value=float(getattr(cfg, "risk_free_rate", 0.02)),
-                                             step=0.001, format="%.3f", key="set_rf")
+                                             step=0.001, format="%.3f", key=self._k("set_rf"))
         cfg.rolling_window = st.number_input("Default rolling window", min_value=10, max_value=500, value=int(getattr(cfg, "rolling_window", 60)),
-                                             step=1, key="set_rollw")
+                                             step=1, key=self._k("set_rollw"))
         cfg.backtest_window = st.number_input("Backtest window", min_value=50, max_value=2000, value=int(getattr(cfg, "backtest_window", 250)),
-                                              step=10, key="set_btwin")
+                                              step=10, key=self._k("set_btwin"))
     with c2:
         st.write("**Correlation Policy**")
         st.selectbox(
             "Default correlation method",
             options=["sample_aligned", "sample_pairwise", "ledoit_wolf"],
             index=0,
-            key="set_corr_method",
+            key=self._k("set_corr_method"),
             help="Used by Risk Analytics tab; Ledoit-Wolf requires scikit-learn."
         )
-        st.checkbox("Default PSD enforcement", value=True, key="set_corr_psd")
+        st.checkbox("Default PSD enforcement", value=True, key=self._k("set_corr_psd"))
 
     st.write("**Institutional Band Policies**")
     st.caption("Defaults: Tracking Error <4% green, 4–8% orange, >8% red. EWMA Ratio green<=0.35, red>=0.55.")
-    st.number_input("Tracking Error green threshold", min_value=0.0, max_value=0.5, value=0.04, step=0.005, key="set_te_green")
-    st.number_input("Tracking Error orange threshold", min_value=0.0, max_value=0.8, value=0.08, step=0.005, key="set_te_orange")
+    st.number_input("Tracking Error green threshold", min_value=0.0, max_value=0.5, value=0.04, step=0.005, key=self._k("set_te_green"))
+    st.number_input("Tracking Error orange threshold", min_value=0.0, max_value=0.8, value=0.08, step=0.005, key=self._k("set_te_orange"))
 
     st.markdown("#### Dependency Status")
     deps = {
@@ -7550,7 +7570,7 @@ def _icd_display_portfolio_lab_fallback(self, cfg):
 
     assets = list(returns_df.columns)
     default_assets = assets[: min(10, len(assets))]
-    sel = st.multiselect("Select assets for optimization", assets, default=default_assets, key="pypf_assets")
+    sel = st.multiselect("Select assets for optimization", assets, default=default_assets, key=self._k("pypf_assets"))
     if len(sel) < 2:
         st.warning("Select at least 2 assets.")
         return
@@ -7561,7 +7581,7 @@ def _icd_display_portfolio_lab_fallback(self, cfg):
         return
 
     st.info("If PyPortfolioOpt is not installed in your environment, this tab will auto-fallback to the internal optimizer.")
-    use_pypfopt = st.checkbox("Use PyPortfolioOpt (if available)", value=True, key="pypf_use")
+    use_pypfopt = st.checkbox("Use PyPortfolioOpt (if available)", value=True, key=self._k("pypf_use"))
 
     if use_pypfopt:
         try:
@@ -7577,7 +7597,7 @@ def _icd_display_portfolio_lab_fallback(self, cfg):
                 "Optimizer",
                 options=["Max Sharpe", "Min Volatility", "Efficient Risk", "Efficient Return", "CLA (min vol)", "HRP"],
                 index=0,
-                key="pypf_type"
+                key=self._k("pypf_type")
             )
 
             if opt_type == "HRP":
@@ -7605,10 +7625,10 @@ def _icd_display_portfolio_lab_fallback(self, cfg):
             elif opt_type == "Min Volatility":
                 ef.min_volatility()
             elif opt_type == "Efficient Risk":
-                target_risk = st.slider("Target risk (annual vol)", min_value=0.05, max_value=0.80, value=0.20, step=0.01, key="pypf_trisk")
+                target_risk = st.slider("Target risk (annual vol)", min_value=0.05, max_value=0.80, value=0.20, step=0.01, key=self._k("pypf_trisk"))
                 ef.efficient_risk(target_volatility=float(target_risk))
             elif opt_type == "Efficient Return":
-                target_ret = st.slider("Target return (annual)", min_value=-0.10, max_value=1.00, value=0.15, step=0.01, key="pypf_tret")
+                target_ret = st.slider("Target return (annual)", min_value=-0.10, max_value=1.00, value=0.15, step=0.01, key=self._k("pypf_tret"))
                 ef.efficient_return(target_return=float(target_ret))
 
             w = ef.clean_weights()
@@ -7623,7 +7643,7 @@ def _icd_display_portfolio_lab_fallback(self, cfg):
             use_pypfopt = False
 
     if not use_pypfopt:
-        method = st.selectbox("Internal optimizer method", options=["sharpe", "min_var", "max_ret"], index=0, key="pypf_int_method")
+        method = st.selectbox("Internal optimizer method", options=["sharpe", "min_var", "max_ret"], index=0, key=self._k("pypf_int_method"))
         try:
             out = self.analytics.optimize_portfolio(df, method=method)
         except Exception as e:
