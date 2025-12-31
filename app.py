@@ -7686,6 +7686,709 @@ except Exception:
     pass
 
 
+
+
+# =============================================================================
+# USDJPY FZ Reaction Monitor (Merged Module)
+# =============================================================================
+
+def run_usdjpy_fz_reaction_monitor():
+    """USDJPY FZ Reaction Monitor (Michaelis–Menten + Peak-Down) — merged as a separate mode."""
+    import streamlit as st
+    import hashlib, time as _time
+    # Stable widget namespace for this mode (prevents StreamlitDuplicateElementKey)
+    if "__mm_widget_ns" not in st.session_state:
+        st.session_state["__mm_widget_ns"] = "mm_" + hashlib.md5(str(_time.time()).encode("utf-8")).hexdigest()[:8]
+    _ns = st.session_state["__mm_widget_ns"]
+    def k(name: str) -> str:
+        return f"{_ns}__{name}"
+
+    # app.py
+    """
+    USDJPY FZ Reaction Monitor — Hybrid Model
+    ========================================
+    Hybrid "macro" model for USDJPY:
+      1) Michaelis–Menten (single-substrate) saturating reaction-speed model
+      2) Peak-Down process: downside spike hazard + expected jump-loss
+
+    "Substrate driver" is built from an explicit FZ (Flow Zone) definition:
+
+    FZ Definition (exact, algorithmic)
+    ----------------------------------
+    For each bar t:
+      - Compute rolling high/low over a lookback window W:
+          H_t = rolling_max(High, W)
+          L_t = rolling_min(Low,  W)
+          R_t = H_t - L_t
+      - Define Flow Zone bounds using Fibonacci retracement band inside that range:
+          FZ_low_t  = L_t + fib_low  * R_t - atr_mult * ATR_t
+          FZ_high_t = L_t + fib_high * R_t + atr_mult * ATR_t
+        where fib_low < fib_high (defaults: 0.382 and 0.618), and ATR is EWMA ATR.
+
+    Interpretation:
+      - FZ is a dynamic "fair-value / flow" band inside the latest range, expanded by ATR buffer.
+      - Reactions are expected near the FZ edges.
+
+    Substrate a_t
+    -------------
+    If Close_t is inside FZ:
+      - edge_pressure_t = 1 - (min(distance to lower edge, distance to upper edge) / half_width)
+        => edge_pressure = 1 at edges, 0 at center
+    Else:
+      - edge_pressure = 0
+
+    Then:
+      - speed_t = |log_return_t| / EWMA_vol_t
+      - a_t = clip(edge_pressure_t * speed_t, 0, a_clip_max)
+
+    Dashboard
+    ---------
+    - Live chart (Plotly): price + FZ band
+    - Risk band + alerts
+    - Signals table + CSV export
+    - Calibration info
+
+    Disclaimer: educational/research tool, not financial advice.
+    """
+    import time
+    import warnings
+    from dataclasses import dataclass
+    from typing import Optional, Tuple, Dict, Any
+
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+    import plotly.graph_objects as go
+
+    try:
+        import yfinance as yf
+    except Exception as e:
+        raise RuntimeError("Missing dependency: yfinance. Add it to requirements.txt.") from e
+
+    try:
+        from scipy.optimize import curve_fit
+    except Exception as e:
+        raise RuntimeError("Missing dependency: scipy. Add it to requirements.txt.") from e
+
+    # Optional: auto-refresh
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        _HAS_AUTOREFRESH = True
+    except Exception:
+        _HAS_AUTOREFRESH = False
+
+    # Optional: statsmodels for logistic fit
+    try:
+        import statsmodels.api as sm
+        _HAS_STATSMODELS = True
+    except Exception:
+        _HAS_STATSMODELS = False
+
+
+    # -----------------------------------------------------------------------------
+    # App setup
+    # -----------------------------------------------------------------------------
+    # (set_page_config handled by master app)
+    # -----------------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------------
+    def sigmoid(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x, -50, 50)
+        return 1.0 / (1.0 + np.exp(-x))
+
+
+    def mm_rate(a: np.ndarray, V: float, Km: float) -> np.ndarray:
+        return (V * a) / (Km + a + 1e-12)
+
+
+    def ewma_vol(r: pd.Series, span: int) -> pd.Series:
+        return r.ewm(span=span, adjust=False, min_periods=span).std()
+
+
+    def compute_atr(df: pd.DataFrame, span: int) -> pd.Series:
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        close = df["Close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        return tr.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+    def rsi(close: pd.Series, n: int) -> pd.Series:
+        delta = close.diff()
+        up = delta.clip(lower=0.0)
+        down = (-delta).clip(lower=0.0)
+        roll_up = up.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+        roll_down = down.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+        rs = roll_up / (roll_down + 1e-12)
+        return 100 - (100 / (1 + rs))
+
+
+    def _fix_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        df = df.rename(columns={c: c.title() for c in df.columns})
+        df.index = pd.to_datetime(df.index)
+        return df
+
+
+    @st.cache_data(ttl=60, show_spinner=False)
+    def fetch_usdjpy(interval: str, period: str, primary: str = "USDJPY=X", fallback: str = "JPY=X") -> pd.DataFrame:
+        """
+        Yahoo Finance FX volume may be NaN; this is OK.
+        For intraday intervals, Yahoo restricts max period (e.g., 15m ~ 60d).
+        """
+        def _dl(ticker: str) -> pd.DataFrame:
+            df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=True)
+            df = _fix_yf_columns(df)
+            if not df.empty:
+                df["Ticker"] = ticker
+            return df
+
+        df = _dl(primary)
+        if df.empty:
+            df = _dl(fallback)
+        if df.empty:
+            raise RuntimeError("Yahoo Finance returned empty data for USDJPY.")
+        # Ensure required columns
+        for c in ["Open", "High", "Low", "Close"]:
+            if c not in df.columns:
+                raise RuntimeError(f"Missing {c} in Yahoo data columns: {list(df.columns)}")
+        return df
+
+
+    # -----------------------------------------------------------------------------
+    # Hybrid model (FZ-driven)
+    # -----------------------------------------------------------------------------
+    @dataclass
+    class FZConfig:
+        lookback: int = 96
+        fib_low: float = 0.382
+        fib_high: float = 0.618
+        atr_span: int = 14
+        atr_mult: float = 0.25
+
+
+    @dataclass
+    class ModelConfig:
+        vol_span: int = 20
+        rsi_window: int = 14
+        ema_fast: int = 12
+        ema_slow: int = 48
+
+        horizon_bars: int = 6
+        jump_quantile: float = 0.995
+        min_train: int = 400
+
+        a_clip: Tuple[float, float] = (0.0, 10.0)
+
+
+    @dataclass
+    class HybridParams:
+        # Michaelis–Menten
+        V: float
+        Km: float
+
+        # Peak-down logistic weights
+        w0: float
+        w_upper: float
+        w_rsi: float
+        w_vol: float
+        w_trend: float
+
+        # Jump magnitude
+        jump_mean: float
+
+        # Jump intensity
+        lam0: float
+        lam1: float
+
+
+    def compute_fz(df: pd.DataFrame, fz: FZConfig) -> pd.DataFrame:
+        out = df.copy()
+        atr = compute_atr(out, span=fz.atr_span)
+        roll_high = out["High"].astype(float).rolling(fz.lookback, min_periods=fz.lookback).max()
+        roll_low = out["Low"].astype(float).rolling(fz.lookback, min_periods=fz.lookback).min()
+        rng = (roll_high - roll_low).clip(lower=1e-12)
+
+        fz_low = roll_low + fz.fib_low * rng - fz.atr_mult * atr
+        fz_high = roll_low + fz.fib_high * rng + fz.atr_mult * atr
+
+        # safety: ensure low <= high
+        swap = fz_low > fz_high
+        if swap.any():
+            tmp = fz_low.copy()
+            fz_low = fz_low.where(~swap, fz_high)
+            fz_high = fz_high.where(~swap, tmp)
+
+        out["ATR"] = atr
+        out["FZ_low"] = fz_low
+        out["FZ_high"] = fz_high
+        out["FZ_center"] = (fz_low + fz_high) / 2.0
+        out["FZ_halfw"] = (fz_high - fz_low) / 2.0
+        out["in_FZ"] = (out["Close"].astype(float) >= fz_low) & (out["Close"].astype(float) <= fz_high)
+        return out
+
+
+    def build_features(df: pd.DataFrame, fz_cfg: FZConfig, mcfg: ModelConfig) -> pd.DataFrame:
+        out = compute_fz(df, fz_cfg)
+        close = out["Close"].astype(float)
+        logp = np.log(close.replace(0, np.nan))
+        r = logp.diff()
+
+        vol = ewma_vol(r, span=mcfg.vol_span)
+        rsi_v = rsi(close, n=mcfg.rsi_window)
+
+        ema_fast = close.ewm(span=mcfg.ema_fast, adjust=False, min_periods=mcfg.ema_slow).mean()
+        ema_slow = close.ewm(span=mcfg.ema_slow, adjust=False, min_periods=mcfg.ema_slow).mean()
+        trend = (ema_fast - ema_slow) / (ema_slow + 1e-12)
+
+        # Edge pressure inside FZ: 1 at edges, 0 at center
+        halfw = out["FZ_halfw"].astype(float).replace(0, np.nan)
+        dist_to_low = (close - out["FZ_low"].astype(float)).abs()
+        dist_to_high = (out["FZ_high"].astype(float) - close).abs()
+        dist_edge = np.minimum(dist_to_low, dist_to_high)
+        edge_pressure = (1.0 - (dist_edge / (halfw + 1e-12))).clip(0.0, 1.0)
+        edge_pressure = edge_pressure.where(out["in_FZ"], 0.0)
+
+        # Upper-edge pressure (0..1) used for peak-down (downside) bias
+        z = ((close - out["FZ_center"].astype(float)) / (halfw + 1e-12)).clip(-1.0, 1.0)  # -1..1
+        upper_edge = np.maximum(z, 0.0)  # 0..1 when above center
+        upper_edge = pd.Series(upper_edge, index=out.index).where(out["in_FZ"], 0.0)
+
+        speed = (r.abs() / (vol + 1e-12)).clip(0.0, mcfg.a_clip[1])
+        a = (edge_pressure * speed).clip(mcfg.a_clip[0], mcfg.a_clip[1])
+
+        out["logp"] = logp
+        out["r"] = r
+        out["vol"] = vol
+        out["rsi"] = rsi_v
+        out["trend"] = trend
+        out["edge_pressure"] = edge_pressure
+        out["upper_edge"] = upper_edge
+        out["speed"] = speed
+        out["a"] = a
+
+        out["fwd_r"] = out["r"].shift(-mcfg.horizon_bars)
+        return out
+
+
+    def fit_hybrid(feats: pd.DataFrame, mcfg: ModelConfig) -> HybridParams:
+        df = feats.dropna(subset=["r", "vol", "a", "upper_edge", "rsi", "trend", "fwd_r"]).copy()
+        if len(df) < mcfg.min_train:
+            raise ValueError(f"Not enough data to fit. Have {len(df)}, need at least {mcfg.min_train} bars.")
+
+        # 1) Fit Michaelis–Menten on |r| vs a
+        a = df["a"].to_numpy(float)
+        y = df["r"].abs().to_numpy(float)
+
+        V0 = float(np.nanpercentile(y, 95)) if np.isfinite(np.nanpercentile(y, 95)) else 1e-3
+        Km0 = float(np.nanmedian(a[a > 0])) if np.any(a > 0) else 0.5
+
+        bounds = ([1e-12, 1e-6], [np.inf, np.inf])
+        try:
+            (V_hat, Km_hat), _ = curve_fit(mm_rate, a, y, p0=[V0, Km0], bounds=bounds, maxfev=20000)
+        except Exception:
+            V_hat = float(np.nanpercentile(y, 99))
+            Km_hat = float(np.nanmedian(a[a > 0])) if np.any(a > 0) else 0.5
+
+        # 2) Define down-jump threshold from tail of |r|
+        r = df["r"].to_numpy(float)
+        thr = float(np.nanquantile(np.abs(r), mcfg.jump_quantile))
+        is_jump_down = (r < -thr).astype(int)
+
+        down_tail = -r[r < -thr]  # positive magnitudes
+        jump_mean = float(np.nanmean(down_tail)) if len(down_tail) > 5 else float(thr)
+
+        # 3) Peak-down events: price in FZ and near upper edge + forward drop
+        k = 2.0
+        peak_down = ((df["upper_edge"] > 0.25) & (df["fwd_r"] < -k * df["vol"])).astype(int)
+
+        # Logistic model on:
+        #  - upper_edge
+        #  - RSI overbought (normalized)
+        #  - vol deviation
+        #  - trend (negative trend increases peak-down probability)
+        X = np.column_stack([
+            np.ones(len(df)),
+            df["upper_edge"].to_numpy(float),
+            (df["rsi"].to_numpy(float) - 50.0) / 10.0,
+            (df["vol"].to_numpy(float) / (df["vol"].median() + 1e-12)) - 1.0,
+            df["trend"].to_numpy(float),
+        ])
+        y_pd = peak_down.to_numpy(int)
+
+        w = np.array([-2.0, 3.5, 1.0, 0.8, -2.0], dtype=float)  # sensible defaults
+        if _HAS_STATSMODELS:
+            try:
+                model = sm.Logit(y_pd, X)
+                res = model.fit(disp=False, maxiter=200)
+                w = res.params.astype(float)
+            except Exception:
+                pass
+
+        # 4) Jump intensity λ ≈ lam0 + lam1 * a
+        a_clip = np.clip(a, 0, mcfg.a_clip[1])
+        yj = is_jump_down.astype(float)
+        A = np.column_stack([np.ones_like(a_clip), a_clip])
+        try:
+            lam_hat, *_ = np.linalg.lstsq(A, yj, rcond=None)
+            lam0, lam1 = float(max(lam_hat[0], 1e-8)), float(max(lam_hat[1], 0.0))
+        except Exception:
+            lam0, lam1 = 1e-4, 1e-3
+
+        return HybridParams(
+            V=float(V_hat), Km=float(Km_hat),
+            w0=float(w[0]), w_upper=float(w[1]), w_rsi=float(w[2]), w_vol=float(w[3]), w_trend=float(w[4]),
+            jump_mean=float(jump_mean),
+            lam0=float(lam0), lam1=float(lam1),
+        )
+
+
+    def predict_hybrid(feats: pd.DataFrame, params: HybridParams, mcfg: ModelConfig) -> pd.DataFrame:
+        df = feats.copy()
+
+        a = df["a"].fillna(0.0).to_numpy(float)
+        mm = mm_rate(a, params.V, params.Km)
+        df["mm_speed"] = mm
+
+        X = np.column_stack([
+            np.ones(len(df)),
+            df["upper_edge"].fillna(0.0).to_numpy(float),
+            (df["rsi"].fillna(50.0).to_numpy(float) - 50.0) / 10.0,
+            (df["vol"].fillna(df["vol"].median()).to_numpy(float) / (df["vol"].median() + 1e-12)) - 1.0,
+            df["trend"].fillna(0.0).to_numpy(float),
+        ])
+        logits = X @ np.array([params.w0, params.w_upper, params.w_rsi, params.w_vol, params.w_trend], dtype=float)
+        p_peakdown = sigmoid(logits)
+        df["p_peakdown"] = p_peakdown
+
+        lam = np.clip(params.lam0 + params.lam1 * np.clip(a, 0, mcfg.a_clip[1]), 0, 0.5)
+        df["lambda_down"] = lam
+        p_jump = 1.0 - np.exp(-lam)
+        df["p_jump_down"] = p_jump
+
+        # Direction gate: within FZ, if close is above center (upper_edge>0) bias to downside; else trend-follow.
+        trend_sign = np.sign(df["trend"].fillna(0.0).to_numpy(float))
+        in_fz = df["in_FZ"].fillna(False).to_numpy(bool)
+        upper = df["upper_edge"].fillna(0.0).to_numpy(float) > 0.35
+        sign = np.where(in_fz & upper, -1.0, np.where(trend_sign == 0, 1.0, trend_sign))
+        df["dir"] = sign
+
+        exp_jump_loss = p_peakdown * p_jump * params.jump_mean
+        df["exp_jump_loss"] = exp_jump_loss
+        df["mu_hat"] = sign * mm - exp_jump_loss
+
+        # Composite downside risk score
+        score = 100.0 * np.clip(0.65 * p_peakdown + 0.35 * p_jump, 0.0, 1.0)
+        df["risk_score"] = score
+        return df
+
+
+    # -----------------------------------------------------------------------------
+    # Plotting
+    # -----------------------------------------------------------------------------
+    def make_price_chart(df: pd.DataFrame, show_markers: bool = True) -> go.Figure:
+        fig = go.Figure()
+
+        fig.add_trace(go.Candlestick(
+            x=df.index,
+            open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            name="USDJPY",
+            increasing_line_width=1,
+            decreasing_line_width=1,
+        ))
+
+        # FZ band
+        if "FZ_low" in df.columns and "FZ_high" in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["FZ_high"],
+                mode="lines", line=dict(width=1),
+                name="FZ High",
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["FZ_low"],
+                mode="lines", line=dict(width=1),
+                fill="tonexty",
+                name="FZ Low (band)",
+                opacity=0.15,
+            ))
+
+        if show_markers and "risk_score" in df.columns:
+            # Mark red/orange signals on close
+            latest_n = min(300, len(df))
+            sub = df.tail(latest_n).copy()
+            red = sub[sub["risk_score"] >= 75]
+            org = sub[(sub["risk_score"] >= 50) & (sub["risk_score"] < 75)]
+            if not red.empty:
+                fig.add_trace(go.Scatter(
+                    x=red.index, y=red["Close"],
+                    mode="markers", name="High Risk",
+                    marker=dict(size=7, symbol="triangle-down"),
+                ))
+            if not org.empty:
+                fig.add_trace(go.Scatter(
+                    x=org.index, y=org["Close"],
+                    mode="markers", name="Medium Risk",
+                    marker=dict(size=6, symbol="circle"),
+                    opacity=0.7,
+                ))
+
+        fig.update_layout(
+            height=560,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title="Time",
+            yaxis_title="USDJPY",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        return fig
+
+
+    def make_risk_chart(df: pd.DataFrame) -> go.Figure:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df["risk_score"], mode="lines", name="Risk Score (0-100)"))
+        # Horizontal bands
+        fig.add_hrect(y0=0, y1=50, opacity=0.08, line_width=0)
+        fig.add_hrect(y0=50, y1=75, opacity=0.12, line_width=0)
+        fig.add_hrect(y0=75, y1=100, opacity=0.16, line_width=0)
+
+        fig.update_layout(
+            height=260,
+            margin=dict(l=10, r=10, t=30, b=10),
+            yaxis=dict(range=[0, 100], title="Risk"),
+            xaxis_title="Time",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        return fig
+
+
+    def make_prob_chart(df: pd.DataFrame) -> go.Figure:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df.index, y=df["p_peakdown"], mode="lines", name="P(peak-down)"))
+        fig.add_trace(go.Scatter(x=df.index, y=df["p_jump_down"], mode="lines", name="P(down-jump)"))
+        fig.update_layout(
+            height=260,
+            margin=dict(l=10, r=10, t=30, b=10),
+            yaxis=dict(range=[0, 1], title="Probability"),
+            xaxis_title="Time",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        return fig
+
+
+    # -----------------------------------------------------------------------------
+    # Alerts
+    # -----------------------------------------------------------------------------
+    def render_alerts(latest: pd.Series) -> None:
+        risk = float(latest.get("risk_score", np.nan))
+        p_pd = float(latest.get("p_peakdown", np.nan))
+        p_jd = float(latest.get("p_jump_down", np.nan))
+        a = float(latest.get("a", np.nan))
+
+        if not np.isfinite(risk):
+            return
+
+        if risk >= 85 and p_pd >= 0.60:
+            st.error(f"🚨 HIGH ALERT: Downside reaction risk is EXTREME (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
+        elif risk >= 75:
+            st.warning(f"⚠️ Warning: Downside reaction risk is HIGH (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
+        elif risk >= 50:
+            st.info(f"🟠 Watch: Medium risk (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
+        else:
+            st.success(f"🟢 Normal: Low risk (risk={risk:.1f}, Ppeakdown={p_pd:.2f}, Pjump={p_jd:.2f}, a={a:.2f})")
+
+
+    # -----------------------------------------------------------------------------
+    # Sidebar controls
+    # -----------------------------------------------------------------------------
+    with st.sidebar:
+        st.title("⚙️ Controls")
+
+        colA, colB = st.columns(2)
+        with colA:
+            interval = st.selectbox("Interval", ["15m", "30m", "1h", "2h", "4h", "1d"], index=2, key=k("interval"))
+        with colB:
+            # Suggest compatible periods
+            period = st.selectbox("Period", ["60d", "180d", "365d", "730d", "max"], index=3, key=k("period"))
+
+        st.divider()
+        st.subheader("FZ Definition (exact)")
+        lookback = st.slider("FZ lookback (bars)", 48, 300, 96, 6, key=k("fz_lookback"))
+        fib_low = st.number_input("fib_low", min_value=0.05, max_value=0.49, value=0.382, step=0.001, format="%.3f", key=k("fib_low"))
+        fib_high = st.number_input("fib_high", min_value=0.51, max_value=0.95, value=0.618, step=0.001, format="%.3f", key=k("fib_high"))
+        atr_span = st.slider("ATR span", 5, 50, 14, 1, key=k("atr_span"))
+        atr_mult = st.slider("ATR buffer multiplier", 0.0, 2.0, 0.25, 0.05, key=k("atr_mult"))
+
+        st.divider()
+        st.subheader("Model")
+        vol_span = st.slider("EWMA vol span", 10, 80, 20, 1, key=k("vol_span"))
+        rsi_window = st.slider("RSI window", 7, 30, 14, 1, key=k("rsi_window"))
+        ema_fast = st.slider("EMA fast", 4, 30, 12, 1, key=k("ema_fast"))
+        ema_slow = st.slider("EMA slow", 20, 120, 48, 1, key=k("ema_slow"))
+
+        horizon_bars = st.slider("Peak-down horizon (bars)", 1, 24, 6, 1, key=k("horizon_bars"))
+        jump_q = st.slider("Jump quantile", 0.950, 0.999, 0.995, 0.001, key=k("jump_q"))
+        a_clip_max = st.slider("Substrate clip max", 2.0, 20.0, 10.0, 0.5, key=k("a_clip_max"))
+
+        st.divider()
+        st.subheader("Live / Alerts")
+        use_autorefresh = st.checkbox("Auto-refresh", value=False, key=k("autorefresh"))
+        refresh_sec = st.slider("Refresh (seconds)", 10, 300, 30, 5, key=k("refresh_sec"))
+        last_n_chart = st.slider("Bars on charts", 150, 1200, 450, 50, key=k("last_n_chart"))
+
+        st.caption("Tip: intraday intervals often require short periods (e.g., 15m with 60d).")
+
+
+    # Auto-refresh
+    if use_autorefresh and _HAS_AUTOREFRESH:
+        st_autorefresh(interval=int(refresh_sec * 1000), limit=None, key=k("auto_rerun"))
+    elif use_autorefresh and not _HAS_AUTOREFRESH:
+        st.info("Auto-refresh needs streamlit-autorefresh. Add it to requirements.txt (already included in the provided file).")
+
+
+    # -----------------------------------------------------------------------------
+    # Main run
+    # -----------------------------------------------------------------------------
+    st.title("📈 USDJPY FZ Reaction Monitor — Michaelis–Menten + Peak-Down")
+
+    with st.expander("Model summary (what you are monitoring)", expanded=False):
+        st.markdown(
+            """
+    - **FZ (Flow Zone)** is computed from a rolling range (**High/Low lookback**) and a **fib retracement band**, expanded by an **ATR buffer**.
+    - **Substrate a(t)** rises when price is **inside the FZ and close to the edges**, while price is moving fast (vol-adjusted).
+    - **Michaelis–Menten** saturates the reaction speed: higher a(t) increases expected move magnitude, but with diminishing returns.
+    - **Peak-down** module estimates downside reaction probability near the **upper side of the FZ**, plus tail-jump risk.
+            """
+        )
+
+    # Fetch and compute
+    with st.spinner("Fetching USDJPY and computing signals..."):
+        raw = fetch_usdjpy(interval=interval, period=period)
+        fz_cfg = FZConfig(lookback=int(lookback), fib_low=float(fib_low), fib_high=float(fib_high), atr_span=int(atr_span), atr_mult=float(atr_mult))
+        mcfg = ModelConfig(
+            vol_span=int(vol_span), rsi_window=int(rsi_window),
+            ema_fast=int(ema_fast), ema_slow=int(ema_slow),
+            horizon_bars=int(horizon_bars), jump_quantile=float(jump_q),
+            a_clip=(0.0, float(a_clip_max)),
+        )
+        feats = build_features(raw, fz_cfg, mcfg)
+
+        # Fit only on sufficiently clean region; show fit diagnostics
+        try:
+            params = fit_hybrid(feats, mcfg)
+        except Exception as e:
+            st.error(f"Model fit failed: {e}")
+            st.stop()
+
+        scored = predict_hybrid(feats, params, mcfg)
+
+    # Slice for charts
+    plot_df = scored.dropna(subset=["Close"]).tail(int(last_n_chart)).copy()
+
+    # KPIs
+    latest = scored.dropna(subset=["mu_hat", "risk_score"]).iloc[-1]
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Close", f"{latest['Close']:.4f}")
+    k2.metric("In FZ", "Yes" if bool(latest.get("in_FZ", False)) else "No")
+    k3.metric("Substrate a(t)", f"{latest.get('a', np.nan):.2f}")
+    k4.metric("MM speed", f"{latest.get('mm_speed', np.nan):.6f}")
+    k5.metric("μ̂ (next-bar)", f"{latest.get('mu_hat', np.nan):.6f}")
+    k6.metric("Risk score", f"{latest.get('risk_score', np.nan):.1f}")
+
+    render_alerts(latest)
+
+    # Layout: charts + signal panels
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Price & FZ", "🧠 Signals", "🧪 Calibration", "📋 Data"])
+
+    with tab1:
+        st.plotly_chart(make_price_chart(plot_df, show_markers=True), use_container_width=True)
+        st.plotly_chart(make_risk_chart(plot_df.dropna(subset=["risk_score"])), use_container_width=True)
+
+    with tab2:
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.plotly_chart(make_prob_chart(plot_df.dropna(subset=["p_peakdown", "p_jump_down"])), use_container_width=True)
+        with c2:
+            st.subheader("Latest signal breakdown")
+            st.write({
+                "timestamp": str(latest.name),
+                "ticker": str(raw["Ticker"].iloc[-1]),
+                "in_FZ": bool(latest.get("in_FZ", False)),
+                "FZ_low": float(latest.get("FZ_low", np.nan)),
+                "FZ_high": float(latest.get("FZ_high", np.nan)),
+                "edge_pressure": float(latest.get("edge_pressure", np.nan)),
+                "upper_edge": float(latest.get("upper_edge", np.nan)),
+                "a": float(latest.get("a", np.nan)),
+                "mm_speed": float(latest.get("mm_speed", np.nan)),
+                "p_peakdown": float(latest.get("p_peakdown", np.nan)),
+                "p_jump_down": float(latest.get("p_jump_down", np.nan)),
+                "exp_jump_loss": float(latest.get("exp_jump_loss", np.nan)),
+                "mu_hat": float(latest.get("mu_hat", np.nan)),
+                "risk_score": float(latest.get("risk_score", np.nan)),
+            })
+
+        st.divider()
+        st.subheader("Band zones (green/orange/red)")
+        st.markdown(
+            """
+    - **Green:** risk < 50  
+    - **Orange:** 50 ≤ risk < 75  
+    - **Red:** risk ≥ 75  
+    You can tighten/loosen these by adjusting the model thresholds (risk chart + markers are based on these cutoffs).
+            """
+        )
+
+    with tab3:
+        st.subheader("Fitted parameters")
+        st.code(
+            f"V={params.V:.6g}, Km={params.Km:.6g}\n"
+            f"Logit weights: w0={params.w0:.4f}, w_upper={params.w_upper:.4f}, w_rsi={params.w_rsi:.4f}, "
+            f"w_vol={params.w_vol:.4f}, w_trend={params.w_trend:.4f}\n"
+            f"Jump mean (down tail)={params.jump_mean:.6g}\n"
+            f"Jump intensity: lam0={params.lam0:.6g}, lam1={params.lam1:.6g}",
+            language="text"
+        )
+
+        st.subheader("Quick sanity plots (last 500 bars)")
+        tmp = scored.dropna(subset=["a", "mm_speed", "r"]).tail(500).copy()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=tmp.index, y=tmp["a"], mode="lines", name="a(t) substrate"))
+        fig.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="a(t)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=tmp.index, y=tmp["r"].abs(), mode="lines", name="|r|"))
+        fig2.add_trace(go.Scatter(x=tmp.index, y=tmp["mm_speed"], mode="lines", name="MM fitted speed"))
+        fig2.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="log-return")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        st.caption("If MM speed lags too much, increase vol span or adjust FZ buffer/edges so a(t) reacts more selectively.")
+
+    with tab4:
+        st.subheader("Signals table")
+        show_cols = [
+            "Open", "High", "Low", "Close",
+            "FZ_low", "FZ_high", "in_FZ",
+            "a", "mm_speed", "p_peakdown", "p_jump_down", "mu_hat", "risk_score",
+        ]
+        tbl = scored[show_cols].dropna(subset=["Close"]).tail(300).copy()
+        st.dataframe(tbl, use_container_width=True, height=520)
+
+        st.download_button(
+            "Download CSV (last 300 rows)",
+            data=tbl.to_csv(index=True).encode("utf-8"),
+            file_name="usdjpy_fz_mm_peakdown_signals.csv",
+            mime="text/csv",
+            key=k("dl_csv"),
+        )
+
+    st.divider()
+    st.caption("Educational/research dashboard. Not financial advice.")
+
+
 def _run_app_router():
     import streamlit as st
 
@@ -7695,13 +8398,16 @@ def _run_app_router():
         options=[
             "🏛️ Institutional Commodities Platform (v6.x)",
             "🧪 Scientific Commodities Platform (v7.2 Ultra)",
-            "🧠 Quantum Sovereign Terminal (v14.0)"
+            "🧠 Quantum Sovereign Terminal (v14.0)",
+            "📈 USDJPY FZ Reaction Monitor (MM + Peak-Down)"
         ],
         index=0,
         key="app_mode_selector"
     )
 
-    if mode == "🧠 Quantum Sovereign Terminal (v14.0)":
+    if mode == "📈 USDJPY FZ Reaction Monitor (MM + Peak-Down)":
+        run_usdjpy_fz_reaction_monitor()
+    elif mode == "🧠 Quantum Sovereign Terminal (v14.0)":
         run_quantum_sovereign_v14_terminal()
     elif mode == "🧪 Scientific Commodities Platform (v7.2 Ultra)":
         run_scientific_platform_v7_2_ultra()
