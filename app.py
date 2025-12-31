@@ -3139,6 +3139,9 @@ class InstitutionalCommoditiesDashboard:
     """Main dashboard class with superior architecture"""
     
     def __init__(self):
+        # Initialize/restore a unique widget namespace for this mode
+        self._init_widget_namespace()
+
         # Initialize components
         self.data_manager = EnhancedDataManager()
         self.analytics = InstitutionalAnalytics()
@@ -3150,6 +3153,30 @@ class InstitutionalCommoditiesDashboard:
         # Performance tracking
         self.start_time = datetime.now()
     
+    # -------------------------------------------------------------------------
+    # Widget key namespacing (prevents StreamlitDuplicateElementKey across modes)
+    # -------------------------------------------------------------------------
+    def _init_widget_namespace(self) -> str:
+        """Create/restore a stable widget-key namespace for Institutional mode.
+
+        Keeps widget keys unique across the mega-app (Institutional/Scientific/Quantum/MM),
+        while preserving widget state across reruns.
+        """
+        import streamlit as st
+        import uuid
+
+        base = st.session_state.get("__icd_widget_ns")
+        if not base:
+            base = f"icd_{uuid.uuid4().hex[:10]}"
+            st.session_state["__icd_widget_ns"] = base
+        self.key_ns = base
+        return base
+
+    def _k(self, name: str) -> str:
+        """Namespaced widget key (Institutional mode)."""
+        ns = getattr(self, "key_ns", None) or self._init_widget_namespace()
+        return f"{ns}__{name}"
+
     def _init_session_state(self):
         """Initialize comprehensive session state"""
         defaults = {
